@@ -24,7 +24,7 @@ jobs:
         with:
           channel: 'stable'
 
-      - name: Create App & Inject Multi-Level Album Downloader
+      - name: Create App & Inject Deep Recursive Engine
         run: |
           flutter create my_downloader --org com.myvidmate.app
           cd my_downloader
@@ -159,155 +159,103 @@ jobs:
                 if (type == 'video' || url.contains('watch?v=') || url.contains('youtu.be/')) {
                   _fetchYouTubeInfo(url);
                 } else {
-                  _smartCategoryOrAlbumCrawler(url, name);
+                  _startDeepCrawlerPrompt(url, name);
                 }
               } catch (_) {}
             }
 
-            // RECURSIVE MULTI-LEVEL CRAWLER: மெயின் தலைப்பு (Tamil Songs) மற்றும் Albums இரண்டையும் பிரித்தெடுக்கும்
-            Future<void> _smartCategoryOrAlbumCrawler(String targetUrl, String titleName) async {
-              String rootName = titleName.replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
+            // DEEP RECURSIVE ENGINE: எத்தனை அடுக்குகள் உள்ளே இருந்தாலும் தேடும் எஞ்சின்
+            void _startDeepCrawlerPrompt(String targetUrl, String folderTitle) {
+              String rootName = folderTitle.replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
               if (rootName.isEmpty) rootName = "Tamil Songs";
 
-              ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("'$rootName' ஆராயப்படுகிறது...")));
+              showDialog(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: Row(
+                    children: [
+                      const Icon(Icons.folder_copy, color: Colors.amber, size: 28),
+                      const SizedBox(width: 8),
+                      Expanded(child: Text(rootName, style: const TextStyle(fontWeight: FontWeight.bold))),
+                    ],
+                  ),
+                  content: Text(
+                    "'$rootName' மற்றும் அதனுள் இருக்கும் அனைத்து Subfolders (உள்ளுக்குள் இருக்கும் அனைத்து அடுக்குகளும்) ஆராயப்பட்டு, பாடல்கள் அதே அடைவு அமைப்பில் (Folder Structure) டவுன்லோட் செய்யப்படும். தொடரவா?",
+                  ),
+                  actions: [
+                    TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
+                    ElevatedButton(
+                      style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                      onPressed: () {
+                        Navigator.pop(ctx);
+                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("'$rootName' முழுமையாகத் தேடப்பட்டு டவுன்லோட் துவங்குகிறது...")));
+                        // Deep Crawl தொடங்குகிறது
+                        _deepCrawlFolder(
+                          url: targetUrl,
+                          currentFolder: rootName,
+                          visited: <String>{},
+                          depth: 0,
+                        );
+                        setState(() => _currentTab = 2);
+                      },
+                      child: const Text("Start Deep Download", style: TextStyle(color: Colors.white)),
+                    )
+                  ],
+                ),
+              );
+            }
+
+            // RECURSIVE FUNCTION (Folder ➔ Subfolder ➔ Sub-subfolder...)
+            Future<void> _deepCrawlFolder({
+              required String url,
+              required String currentFolder,
+              required Set<String> visited,
+              required int depth,
+            }) async {
+              if (depth > 5 || visited.contains(url)) return;
+              visited.add(url);
 
               try {
-                var dio = _getSafeDio(targetUrl);
-                var res = await dio.get(targetUrl);
+                var dio = _getSafeDio(url);
+                var res = await dio.get(url);
                 String html = res.data.toString();
 
-                // 1. நேரடி ஆடியோ ஃபைல்கள் உள்ளதா என சோதித்தல்
+                // 1. இந்த மட்டத்தில் உள்ள அனைத்து பாடல்களையும் டவுன்லோட் செய்தல்
                 final audioRegex = RegExp(
                   r"""["'\(]([^"'()\s<>]+\.(?:mp3|m4a|mp4|wav|aac)[^"'()\s<>]*)["'\)]""",
                   caseSensitive: false,
                 );
-                var audioMatches = audioRegex.allMatches(html);
-                List<String> directMedia = [];
-                for (var m in audioMatches) {
+                for (var m in audioRegex.allMatches(html)) {
                   String raw = m.group(1)!;
                   if (raw.contains('?') && !raw.contains('.mp3')) continue;
-                  String full = raw.startsWith('http') ? raw : Uri.parse(targetUrl).resolve(raw).toString();
-                  if (!directMedia.contains(full)) directMedia.add(full);
+                  String fullSongUrl = raw.startsWith('http') ? raw : Uri.parse(url).resolve(raw).toString();
+
+                  _startFileDownload(fullSongUrl, currentFolder, url);
                 }
 
-                // 2. உள்ளே இருக்கும் Sub-Albums (Aalayamani, Amaithikaaga...) இணைப்புகளைத் தேடுதல்
+                // 2. உள்ளே இருக்கும் Subfolder-களைத் தேடி அவற்றிற்குள் நுழைதல் (Recursion)
                 final linkRegex = RegExp(r"""<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>""", caseSensitive: false, dotAll: true);
-                Map<String, String> subAlbums = {};
-
                 for (var m in linkRegex.allMatches(html)) {
                   String href = m.group(1)!;
-                  String text = m.group(2)!.replaceAll(RegExp(r'<[^>]*>'), '').trim();
-                  text = text.replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
+                  String subName = m.group(2)!.replaceAll(RegExp(r'<[^>]*>'), '').trim();
+                  subName = subName.replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
 
-                  if (text.isNotEmpty && text.length > 2 && !href.startsWith('#') && !href.startsWith('javascript:')) {
-                    if (!['Home', 'Songs', 'Bible', 'Quiz', 'Search', 'Contact', 'Facebook', 'About'].contains(text)) {
-                      String fullUrl = href.startsWith('http') ? href : Uri.parse(targetUrl).resolve(href).toString();
-                      if (fullUrl != targetUrl) {
-                        subAlbums[text] = fullUrl;
+                  if (subName.isNotEmpty && subName.length > 2 && !href.startsWith('#') && !href.startsWith('javascript:')) {
+                    if (!['Home', 'Songs', 'Bible', 'Quiz', 'Search', 'Contact', 'Facebook', 'About'].contains(subName)) {
+                      String nextUrl = href.startsWith('http') ? href : Uri.parse(url).resolve(href).toString();
+                      if (!visited.contains(nextUrl) && !nextUrl.contains('.mp3')) {
+                        // அடுத்த Subfolder-க்குள் தானாகச் செல்கிறது
+                        await _deepCrawlFolder(
+                          url: nextUrl,
+                          currentFolder: "$currentFolder/$subName",
+                          visited: visited,
+                          depth: depth + 1,
+                        );
                       }
                     }
                   }
                 }
-
-                // A. மெயின் Category (உள்ளே Albums இருந்தால்)
-                if (subAlbums.isNotEmpty && directMedia.isEmpty) {
-                  showDialog(
-                    context: context,
-                    builder: (ctx) => AlertDialog(
-                      title: Row(
-                        children: [
-                          const Icon(Icons.folder_special, color: Colors.amber, size: 28),
-                          const SizedBox(width: 8),
-                          Expanded(child: Text(rootName, style: const TextStyle(fontWeight: FontWeight.bold))),
-                        ],
-                      ),
-                      content: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text("📁 ${subAlbums.length} Albums கண்டறியப்பட்டன!", style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.blue)),
-                          const SizedBox(height: 6),
-                          Text("உதாரணம்: ${subAlbums.keys.take(3).join(', ')}..."),
-                          const SizedBox(height: 12),
-                          Text("Download/$rootName/ என்ற Main Folder-க்குள் அனைத்து Albums-களையும் தனித்தனி Subfolder-ஆக உருவாக்கி அத்தனை பாடல்களையும் டவுன்லோட் செய்யவா?"),
-                        ],
-                      ),
-                      actions: [
-                        TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
-                        ElevatedButton(
-                          style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-                          onPressed: () {
-                            Navigator.pop(ctx);
-                            _crawlAndDownloadAllSubAlbums(rootName, subAlbums);
-                            setState(() => _currentTab = 2);
-                          },
-                          child: Text("Download All (${subAlbums.length} Albums)", style: const TextStyle(color: Colors.white)),
-                        )
-                      ],
-                    ),
-                  );
-                } 
-                // B. ஒற்றை Album (நேரடிப் பாடல்கள் இருந்தால்)
-                else if (directMedia.isNotEmpty) {
-                  showDialog(
-                    context: context,
-                    builder: (ctx) => AlertDialog(
-                      title: Text("📁 $rootName Album"),
-                      content: Text("இந்த Album-ல் ${directMedia.length} பாடல்கள் உள்ளன! அனைத்தையும் Download/$rootName/ ஃபோல்டரில் டவுன்லோட் செய்யவா?"),
-                      actions: [
-                        TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
-                        ElevatedButton(
-                          style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-                          onPressed: () {
-                            Navigator.pop(ctx);
-                            for (var song in directMedia) {
-                              _startFileDownload(song, rootName, targetUrl);
-                            }
-                            setState(() => _currentTab = 2);
-                          },
-                          child: Text("Download All (${directMedia.length})", style: const TextStyle(color: Colors.white)),
-                        )
-                      ],
-                    ),
-                  );
-                } else {
-                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("பாடல்கள் எதுவும் கண்டறியப்படவில்லை!")));
-                }
-              } catch (e) {
-                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Error: $e")));
-              }
-            }
-
-            // ஒவ்வொரு Album-க்குள்ளும் சென்று பாடல்களை எடுத்து Subfolder-ல் போடும் எஞ்சின்
-            Future<void> _crawlAndDownloadAllSubAlbums(String parentFolder, Map<String, String> albums) async {
-              ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("'$parentFolder' அணைத்து Albums-களும் டவுன்லோட் செய்யப்படுகின்றன...")));
-
-              for (var entry in albums.entries) {
-                String albumName = entry.key;
-                String albumUrl = entry.value;
-
-                try {
-                  var dio = _getSafeDio(albumUrl);
-                  var res = await dio.get(albumUrl);
-                  String html = res.data.toString();
-
-                  final audioRegex = RegExp(
-                    r"""["'\(]([^"'()\s<>]+\.(?:mp3|m4a|mp4|wav|aac)[^"'()\s<>]*)["'\)]""",
-                    caseSensitive: false,
-                  );
-                  var matches = audioRegex.allMatches(html);
-
-                  for (var m in matches) {
-                    String raw = m.group(1)!;
-                    if (raw.contains('?') && !raw.contains('.mp3')) continue;
-                    String fullSongUrl = raw.startsWith('http') ? raw : Uri.parse(albumUrl).resolve(raw).toString();
-
-                    // மெயின் போல்டர் / சப்-போல்டர் அமைப்பு (எ.கா: Tamil Songs/Aalayamani)
-                    String subfolderPath = "$parentFolder/$albumName";
-                    _startFileDownload(fullSongUrl, subfolderPath, albumUrl);
-                  }
-                } catch (_) {}
-              }
+              } catch (_) {}
             }
 
             Future<void> _startFileDownload(String fileUrl, String subfolder, String referer) async {
@@ -330,7 +278,7 @@ jobs:
                 Directory baseDir = Directory('/storage/emulated/0/Download');
                 if (!await baseDir.exists()) baseDir = (await getExternalStorageDirectory())!;
                 
-                // Nested Subfolder உருவாக்கம்: Download/Tamil Songs/Aalayamani/
+                // Nested Folders (Download/Tamil Songs/Aalayamani/Folder1/Folder2/) தானாக உருவாகும்
                 Directory targetDir = Directory('${baseDir.path}/$subfolder');
                 if (!await targetDir.exists()) await targetDir.create(recursive: true);
 
@@ -719,7 +667,7 @@ jobs:
                             if (u.contains('watch') || u.contains('youtu.be')) {
                               _fetchYouTubeInfo(u);
                             } else {
-                              _smartCategoryOrAlbumCrawler(u, "Downloads");
+                              _startDeepCrawlerPrompt(u, "Downloads");
                             }
                           }
                         },
