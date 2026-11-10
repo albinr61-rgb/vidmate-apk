@@ -24,7 +24,7 @@ jobs:
         with:
           channel: 'stable'
 
-      - name: Create App & Inject Deep Recursive Engine
+      - name: Create App & Inject Folder Long Press Engine
         run: |
           flutter create my_downloader --org com.myvidmate.app
           cd my_downloader
@@ -94,11 +94,12 @@ jobs:
               return Dio(BaseOptions(
                 headers: {
                   'User-Agent': _isDesktopMode ? desktopUA : mobileUA,
-                  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                  'Accept': '*/*',
                   'Referer': refererUrl,
                 },
                 followRedirects: true,
-                validateStatus: (status) => status != null && status < 500,
+                connectTimeout: const Duration(seconds: 25),
+                receiveTimeout: const Duration(seconds: 35),
               ));
             }
 
@@ -124,24 +125,48 @@ jobs:
                       _searchController.text = url;
                     },
                     onPageFinished: (url) {
+                      // மொபைலில் Touch Long Press & ContextMenu இரண்டையும் துல்லியமாகப் பிடிக்கும் JS
                       _webController.runJavaScript(r"""
+                        var touchTimer = null;
                         var isBusy = false;
-                        document.addEventListener('contextmenu', function(e) {
-                          if (isBusy) return;
-                          var link = e.target.closest('a');
-                          if (link && link.href) {
-                            e.preventDefault();
-                            isBusy = true;
-                            setTimeout(function() { isBusy = false; }, 1200);
 
-                            var title = link.innerText.trim() || link.getAttribute('aria-label') || link.title || 'Item';
-                            LongPressDetector.postMessage(JSON.stringify({
-                              type: (link.href.includes('watch') || link.href.includes('youtu.be')) ? 'video' : 'folder',
-                              url: link.href,
-                              name: title
-                            }));
+                        function triggerLongPress(link) {
+                          if (isBusy || !link || !link.href) return;
+                          isBusy = true;
+                          setTimeout(function() { isBusy = false; }, 1500);
+
+                          var title = link.innerText.trim() || link.getAttribute('aria-label') || link.title || 'Folder';
+                          LongPressDetector.postMessage(JSON.stringify({
+                            type: (link.href.includes('watch') || link.href.includes('youtu.be')) ? 'video' : 'folder',
+                            url: link.href,
+                            name: title
+                          }));
+                        }
+
+                        document.addEventListener('contextmenu', function(e) {
+                          var link = e.target.closest('a');
+                          if (link) {
+                            e.preventDefault();
+                            triggerLongPress(link);
                           }
                         }, true);
+
+                        document.addEventListener('touchstart', function(e) {
+                          var link = e.target.closest('a');
+                          if (link) {
+                            touchTimer = setTimeout(function() {
+                              triggerLongPress(link);
+                            }, 650);
+                          }
+                        }, {passive: true});
+
+                        document.addEventListener('touchend', function() {
+                          if (touchTimer) clearTimeout(touchTimer);
+                        }, {passive: true});
+
+                        document.addEventListener('touchmove', function() {
+                          if (touchTimer) clearTimeout(touchTimer);
+                        }, {passive: true});
                       """);
                     },
                   ),
@@ -159,98 +184,128 @@ jobs:
                 if (type == 'video' || url.contains('watch?v=') || url.contains('youtu.be/')) {
                   _fetchYouTubeInfo(url);
                 } else {
-                  _startDeepCrawlerPrompt(url, name);
+                  // நீங்கள் Long Press செய்த தலைப்பின் பெயரிலேயே (Tamil Songs) மெயின் Folder உருவாகும்
+                  _onFolderLongPressed(url, name);
                 }
               } catch (_) {}
             }
 
-            // DEEP RECURSIVE ENGINE: எத்தனை அடுக்குகள் உள்ளே இருந்தாலும் தேடும் எஞ்சின்
-            void _startDeepCrawlerPrompt(String targetUrl, String folderTitle) {
-              String rootName = folderTitle.replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
+            // FOLDER LONG PRESS HANDLER: 'Tamil Songs' என்ற பெயரில் Main Folder உருவாக்கும் முறை
+            Future<void> _onFolderLongPressed(String targetUrl, String folderName) async {
+              String rootName = folderName.replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
               if (rootName.isEmpty) rootName = "Tamil Songs";
 
-              showDialog(
-                context: context,
-                builder: (ctx) => AlertDialog(
-                  title: Row(
-                    children: [
-                      const Icon(Icons.folder_copy, color: Colors.amber, size: 28),
-                      const SizedBox(width: 8),
-                      Expanded(child: Text(rootName, style: const TextStyle(fontWeight: FontWeight.bold))),
-                    ],
-                  ),
-                  content: Text(
-                    "'$rootName' மற்றும் அதனுள் இருக்கும் அனைத்து Subfolders (உள்ளுக்குள் இருக்கும் அனைத்து அடுக்குகளும்) ஆராயப்பட்டு, பாடல்கள் அதே அடைவு அமைப்பில் (Folder Structure) டவுன்லோட் செய்யப்படும். தொடரவா?",
-                  ),
-                  actions: [
-                    TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
-                    ElevatedButton(
-                      style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-                      onPressed: () {
-                        Navigator.pop(ctx);
-                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("'$rootName' முழுமையாகத் தேடப்பட்டு டவுன்லோட் துவங்குகிறது...")));
-                        // Deep Crawl தொடங்குகிறது
-                        _deepCrawlFolder(
-                          url: targetUrl,
-                          currentFolder: rootName,
-                          visited: <String>{},
-                          depth: 0,
-                        );
-                        setState(() => _currentTab = 2);
-                      },
-                      child: const Text("Start Deep Download", style: TextStyle(color: Colors.white)),
-                    )
-                  ],
-                ),
-              );
-            }
-
-            // RECURSIVE FUNCTION (Folder ➔ Subfolder ➔ Sub-subfolder...)
-            Future<void> _deepCrawlFolder({
-              required String url,
-              required String currentFolder,
-              required Set<String> visited,
-              required int depth,
-            }) async {
-              if (depth > 5 || visited.contains(url)) return;
-              visited.add(url);
+              ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("'$rootName' பகுப்பாய்வு செய்யப்படுகிறது...")));
 
               try {
-                var dio = _getSafeDio(url);
-                var res = await dio.get(url);
+                var dio = _getSafeDio(targetUrl);
+                var res = await dio.get(targetUrl);
                 String html = res.data.toString();
 
-                // 1. இந்த மட்டத்தில் உள்ள அனைத்து பாடல்களையும் டவுன்லோட் செய்தல்
-                final audioRegex = RegExp(
-                  r"""["'\(]([^"'()\s<>]+\.(?:mp3|m4a|mp4|wav|aac)[^"'()\s<>]*)["'\)]""",
-                  caseSensitive: false,
-                );
-                for (var m in audioRegex.allMatches(html)) {
-                  String raw = m.group(1)!;
-                  if (raw.contains('?') && !raw.contains('.mp3')) continue;
-                  String fullSongUrl = raw.startsWith('http') ? raw : Uri.parse(url).resolve(raw).toString();
+                // 1. உள்ளே இருக்கும் நேரடி MP3 பாடல்கள்
+                final mp3Regex = RegExp(r"""[^\s"\'<>\\\/=]+\.mp3""", caseSensitive: false);
+                var directMp3s = mp3Regex.allMatches(html).map((m) => m.group(0)!).toSet().toList();
 
-                  _startFileDownload(fullSongUrl, currentFolder, url);
+                // 2. உள்ளே இருக்கும் Subfolders / Albums (Aalayamani, Amaithikaaga...)
+                final linkRegex = RegExp(r"""<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>""", caseSensitive: false, dotAll: true);
+                List<Map<String, String>> subFolders = [];
+
+                for (var m in linkRegex.allMatches(html)) {
+                  String href = m.group(1)!;
+                  String subName = m.group(2)!.replaceAll(RegExp(r'<[^>]*>'), '').trim();
+                  subName = subName.replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
+
+                  if (subName.length > 1 && !href.startsWith('#') && !href.startsWith('javascript:')) {
+                    if (!['Home', 'Songs', 'Bible', 'Quiz', 'Search', 'Contact', 'TV', 'Facebook', 'About'].contains(subName)) {
+                      String nextUrl = href.startsWith('http') ? href : Uri.parse(targetUrl).resolve(href).toString();
+                      if (!subFolders.any((e) => e['url'] == nextUrl)) {
+                        subFolders.add({'name': subName, 'url': nextUrl});
+                      }
+                    }
+                  }
                 }
 
-                // 2. உள்ளே இருக்கும் Subfolder-களைத் தேடி அவற்றிற்குள் நுழைதல் (Recursion)
+                showDialog(
+                  context: context,
+                  builder: (ctx) => AlertDialog(
+                    title: Row(
+                      children: [
+                        const Icon(Icons.folder_special, color: Colors.amber, size: 28),
+                        const SizedBox(width: 8),
+                        Expanded(child: Text(rootName, style: const TextStyle(fontWeight: FontWeight.bold))),
+                      ],
+                    ),
+                    content: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        if (subFolders.isNotEmpty)
+                          Text("📁 ${subFolders.length} Albums / Subfolders உள்ளன!", style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.blue)),
+                        if (subFolders.isNotEmpty)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 4, bottom: 8),
+                            child: Text("உதாரணம்: ${subFolders.take(3).map((e) => e['name']).join(', ')}...", style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                          ),
+                        if (directMp3s.isNotEmpty)
+                          Text("🎵 ${directMp3s.length} நேரடிப் பாடல்கள் உள்ளன!", style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.green)),
+                        const SizedBox(height: 12),
+                        Text("Download/$rootName/ என்ற மெயின் Folder-க்குள் அனைத்தையும் Subfolders-ஆக டவுன்லோட் செய்யவா?"),
+                      ],
+                    ),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
+                      ElevatedButton(
+                        style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                        onPressed: () {
+                          Navigator.pop(ctx);
+                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("'$rootName' டவுன்லோட் தொடங்குகிறது...")));
+                          
+                          // rootName (Tamil Songs) மெயின் ஃபோல்டராகக் கொண்டு recursive crawl துவங்குகிறது
+                          _crawlFolderRecursively(targetUrl, rootName, <String>{}, 0);
+                          setState(() => _currentTab = 2);
+                        },
+                        child: const Text("Download All", style: TextStyle(color: Colors.white)),
+                      )
+                    ],
+                  ),
+                );
+              } catch (e) {
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Error: $e")));
+              }
+            }
+
+            // RECURSIVE ENGINE: Tamil Songs ➔ Aalayamani ➔ பாடல்கள் என கடைசி வரை செல்லும் முறை
+            Future<void> _crawlFolderRecursively(String currentUrl, String currentPath, Set<String> visited, int depth) async {
+              if (depth > 5 || visited.contains(currentUrl)) return;
+              visited.add(currentUrl);
+
+              try {
+                var dio = _getSafeDio(currentUrl);
+                var res = await dio.get(currentUrl);
+                String html = res.data.toString();
+
+                // 1. இந்த மட்டத்தில் உள்ள பாடல்களை டவுன்லோட் செய்தல்
+                final mp3Regex = RegExp(r"""[^\s"\'<>\\\/=]+\.mp3""", caseSensitive: false);
+                var matches = mp3Regex.allMatches(html);
+                for (var m in matches) {
+                  String songName = m.group(0)!;
+                  String fullSongUrl = Uri.parse(currentUrl).resolve(songName).toString();
+                  _startFileDownload(fullSongUrl, currentPath, currentUrl);
+                }
+
+                // 2. உள்ளே இருக்கும் அனைத்து Subfolders-களுக்குள்ளும் நுழைதல்
                 final linkRegex = RegExp(r"""<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>""", caseSensitive: false, dotAll: true);
                 for (var m in linkRegex.allMatches(html)) {
                   String href = m.group(1)!;
                   String subName = m.group(2)!.replaceAll(RegExp(r'<[^>]*>'), '').trim();
                   subName = subName.replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
 
-                  if (subName.isNotEmpty && subName.length > 2 && !href.startsWith('#') && !href.startsWith('javascript:')) {
-                    if (!['Home', 'Songs', 'Bible', 'Quiz', 'Search', 'Contact', 'Facebook', 'About'].contains(subName)) {
-                      String nextUrl = href.startsWith('http') ? href : Uri.parse(url).resolve(href).toString();
-                      if (!visited.contains(nextUrl) && !nextUrl.contains('.mp3')) {
-                        // அடுத்த Subfolder-க்குள் தானாகச் செல்கிறது
-                        await _deepCrawlFolder(
-                          url: nextUrl,
-                          currentFolder: "$currentFolder/$subName",
-                          visited: visited,
-                          depth: depth + 1,
-                        );
+                  if (subName.length > 1 && !href.startsWith('#') && !href.startsWith('javascript:')) {
+                    if (!['Home', 'Songs', 'Bible', 'Quiz', 'Search', 'Contact', 'TV', 'Facebook'].contains(subName)) {
+                      String nextUrl = href.startsWith('http') ? href : Uri.parse(currentUrl).resolve(href).toString();
+                      if (!visited.contains(nextUrl) && !nextUrl.endsWith('.mp3')) {
+                        // எ.கா: Download/Tamil Songs/Aalayamani
+                        await _crawlFolderRecursively(nextUrl, "$currentPath/$subName", visited, depth + 1);
                       }
                     }
                   }
@@ -278,7 +333,7 @@ jobs:
                 Directory baseDir = Directory('/storage/emulated/0/Download');
                 if (!await baseDir.exists()) baseDir = (await getExternalStorageDirectory())!;
                 
-                // Nested Folders (Download/Tamil Songs/Aalayamani/Folder1/Folder2/) தானாக உருவாகும்
+                // Nested Folders (Download/Tamil Songs/Aalayamani/) தானாக உருவாகும்
                 Directory targetDir = Directory('${baseDir.path}/$subfolder');
                 if (!await targetDir.exists()) await targetDir.create(recursive: true);
 
@@ -667,7 +722,7 @@ jobs:
                             if (u.contains('watch') || u.contains('youtu.be')) {
                               _fetchYouTubeInfo(u);
                             } else {
-                              _startDeepCrawlerPrompt(u, "Downloads");
+                              _onFolderLongPressed(u, "Tamil Songs");
                             }
                           }
                         },
@@ -695,9 +750,9 @@ jobs:
           }
           EOF
 
-          # Permissions
+          # Cleartext HTTP (அனைத்து HTTP தளங்களும் வேலை செய்ய அனுமதி) மற்றும் Permissions
           sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>' android/app/src/main/AndroidManifest.xml
-          sed -i 's/<application/<application android:requestLegacyExternalStorage="true"/' android/app/src/main/AndroidManifest.xml
+          sed -i 's/<application/<application android:usesCleartextTraffic="true" android:requestLegacyExternalStorage="true"/' android/app/src/main/AndroidManifest.xml
 
       - name: Build Release APK
         run: |
