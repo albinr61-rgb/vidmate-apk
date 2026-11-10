@@ -1,122 +1,139 @@
 name: Build APK
-on: workflow_dispatch
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: unzip FolderGrab.zip
 
-      # ★ Folder Long Press-ஐ பாதிக்காமல் Video Quality வசதியை மட்டும் இணைக்கும் தானியங்கி Script ★
+      - name: Unzip Project
+        run: unzip FolderGrab.zip
+
       - name: Inject Video Quality Feature
         run: |
           python3 - << 'EOF'
+          import os
+
           # 1. Update MainActivity.kt
-          main_path = "FolderGrab/app/src/main/java/com/example/foldergrab/MainActivity.kt"
-          with open(main_path, "r", encoding="utf-8") as f:
-              content = f.read()
-          content = content.replace("grabber.confirmAndGrab(extra, w.url ?: extra)", "grabber.checkAndGrab(extra, w.url ?: extra)")
-          content = content.replace("grabber.confirmAndGrab(u, w.url ?: u)", "grabber.checkAndGrab(u, w.url ?: u)")
-          with open(main_path, "w", encoding="utf-8") as f:
-              f.write(content)
+          m_path = "FolderGrab/app/src/main/java/com/example/foldergrab/MainActivity.kt"
+          if os.path.exists(m_path):
+              with open(m_path, "r", encoding="utf-8") as f:
+                  m = f.read()
+              m = m.replace("grabber.confirmAndGrab(extra, w.url ?: extra)", "grabber.checkAndGrab(extra, w.url ?: extra)")
+              m = m.replace("grabber.confirmAndGrab(u, w.url ?: u)", "grabber.checkAndGrab(u, w.url ?: u)")
+              with open(m_path, "w", encoding="utf-8") as f:
+                  f.write(m)
 
           # 2. Update Grabber.kt
-          grabber_path = "FolderGrab/app/src/main/java/com/example/foldergrab/Grabber.kt"
-          with open(grabber_path, "r", encoding="utf-8") as f:
-              g_content = f.read()
+          g_path = "FolderGrab/app/src/main/java/com/example/foldergrab/Grabber.kt"
+          if os.path.exists(g_path):
+              with open(g_path, "r", encoding="utf-8") as f:
+                  g = f.read()
 
-          video_feature = """
-    fun checkAndGrab(link: String, page: String) {
-        if (running) { toast("Thedura vela innum odikittu irukku"); return }
-        if (isMedia(link)) { downloadSingle(link, page); return }
-        if (dlRunning) { toast("Download mudiyura varaikum kaathirunga"); return }
-        val low = link.lowercase()
-        val isLikelyVideo = low.contains("video") || low.contains("watch") || low.contains("view") ||
-                low.contains("play") || low.contains("clip") || low.contains("movie") || low.contains("song")
-        if (isLikelyVideo) {
-            inspectVideoPage(link, page)
-        } else {
-            confirmAndGrab(link, page)
-        }
-    }
+              video_code = """
+          fun checkAndGrab(link: String, page: String) {
+              if (running) { toast("Thedura vela innum odikittu irukku"); return }
+              if (isMedia(link)) { downloadSingle(link, page); return }
+              if (dlRunning) { toast("Download mudiyura varaikum kaathirunga"); return }
+              val low = link.lowercase()
+              val isLikelyVideo = low.contains("video") || low.contains("watch") || low.contains("view") ||
+                      low.contains("play") || low.contains("clip") || low.contains("movie") || low.contains("song")
+              if (isLikelyVideo) {
+                  inspectVideoPage(link, page)
+              } else {
+                  confirmAndGrab(link, page)
+              }
+          }
 
-    private fun inspectVideoPage(link: String, page: String) {
-        toast("Video details edukkuren...")
-        Thread {
-            try {
-                val ctx = HttpCtx(view.settings.userAgentString, CookieManager.getInstance().getCookie(link), page)
-                val html = httpText(link, ctx)
-                val unescaped = html.replace("\\\\/", "/")
-                val foundUrls = LinkedHashMap<String, String>()
-                val lbls = HashMap<String, String>()
+          private fun inspectVideoPage(link: String, page: String) {
+              toast("Video details edukkuren...")
+              Thread {
+                  try {
+                      val ctx = HttpCtx(view.settings.userAgentString, CookieManager.getInstance().getCookie(link), page)
+                      val html = httpText(link, ctx)
+                      val unescaped = html.replace("\\\\/", "/")
+                      val foundUrls = LinkedHashMap<String, String>()
+                      val lbls = HashMap<String, String>()
 
-                val re = Regex(\"\"\"(?i)(https?://[^\\s\"'<>]+\\.(?:mp4|webm|m3u8)(?:\\?[^\\s\"'<>]*)?)\"\"\")
-                for (m in re.findAll(unescaped)) {
-                    val u = m.groupValues[1]
-                    if (!isBlockedHost(u) && !foundUrls.containsKey(u)) {
-                        foundUrls[u] = ""
-                        val start = maxOf(0, m.range.first - 80)
-                        val end = minOf(unescaped.length, m.range.last + 80)
-                        val context = unescaped.substring(start, end)
-                        val q = qualityOf(u, context)
-                        if (q != null) lbls[u] = \"${q}p\"
-                    }
-                }
+                      val re = Regex("(?i)(https?://[^\\\\s\"'<>]+?\\\\.(mp4|webm|m3u8)(\\\\?[^\\\\s\"'<>]*)?)")
+                      for (m in re.findAll(unescaped)) {
+                          val u = m.groupValues[1]
+                          if (!isBlockedHost(u) && !foundUrls.containsKey(u)) {
+                              foundUrls[u] = ""
+                              val start = maxOf(0, m.range.first - 80)
+                              val end = minOf(unescaped.length, m.range.last + 80)
+                              val context = unescaped.substring(start, end)
+                              val q = qualityOf(u, context)
+                              if (q != null) lbls[u] = q.toString() + "p"
+                          }
+                      }
 
-                val relRe = Regex(\"\"\"(?i)[\"'](/[^\"'<>\\s\\\\]+?\\.(?:mp4|webm)(?:\\?[^\"'<>\\s\\\\]*)?)[\"']\"\"\")
-                for (m in relRe.findAll(unescaped)) {
-                    val rel = m.groupValues[1]
-                    try {
-                        val full = URL(URL(link), rel).toString()
-                        if (!foundUrls.containsKey(full)) {
-                            foundUrls[full] = ""
-                            val q = qualityOf(full, "")
-                            if (q != null) lbls[full] = \"${q}p\"
-                        }
-                    } catch (e: Exception) {}
-                }
+                      val relRe = Regex("(?i)[\"'](/[^\"'<>\\\\s\\\\\\\\]+?\\\\.(mp4|webm)(\\\\?[^\"'<>\\\\s\\\\\\\\]*)?)[\"']")
+                      for (m in relRe.findAll(unescaped)) {
+                          val rel = m.groupValues[1]
+                          try {
+                              val full = URL(URL(link), rel).toString()
+                              if (!foundUrls.containsKey(full)) {
+                                  foundUrls[full] = ""
+                                  val q = qualityOf(full, "")
+                                  if (q != null) lbls[full] = q.toString() + "p"
+                              }
+                          } catch (e: Exception) {}
+                      }
 
-                handler.post {
-                    if (foundUrls.isNotEmpty()) {
-                        found.clear(); refs.clear(); labels.clear(); names.clear(); qkeys.clear()
-                        rootLink = link
-                        for ((u, _) in foundUrls) {
-                            found[u] = ""
-                            refs[u] = link
-                            lbls[u]?.let { labels[u] = it }
-                        }
-                        val hlsList = foundUrls.keys.filter { extOf(pathOf(it)) == "m3u8" }
-                        if (hlsList.isNotEmpty()) {
-                            presentDetected(foundUrls.keys.toList(), link, \"video\", lbls)
-                        } else {
-                            presentSources(found, link)
-                        }
-                    } else {
-                        confirmAndGrab(link, page)
-                    }
-                }
-            } catch (e: Exception) {
-                handler.post { confirmAndGrab(link, page) }
-            }
-        }.start()
-    }
-"""
-          g_content = g_content.replace("fun confirmAndGrab(link: String, page: String) {", video_feature + "\n    fun confirmAndGrab(link: String, page: String) {")
-          with open(grabber_path, "w", encoding="utf-8") as f:
-              f.write(g_content)
-          print("Successfully updated video quality feature!")
+                      handler.post {
+                          if (foundUrls.isNotEmpty()) {
+                              found.clear(); refs.clear(); labels.clear(); names.clear(); qkeys.clear()
+                              rootLink = link
+                              for ((u, _) in foundUrls) {
+                                  found[u] = ""
+                                  refs[u] = link
+                                  lbls[u]?.let { labels[u] = it }
+                              }
+                              val hlsList = foundUrls.keys.filter { extOf(pathOf(it)) == "m3u8" }
+                              if (hlsList.isNotEmpty()) {
+                                  presentDetected(foundUrls.keys.toList(), link, "video", lbls)
+                              } else {
+                                  presentSources(found, link)
+                              }
+                          } else {
+                              confirmAndGrab(link, page)
+                          }
+                      }
+                  } catch (e: Exception) {
+                      handler.post { confirmAndGrab(link, page) }
+                  }
+              }.start()
+          }
+          """
+
+              target = "fun confirmAndGrab(link: String, page: String) {"
+              if target in g:
+                  g = g.replace(target, video_code + "\n    " + target)
+                  with open(g_path, "w", encoding="utf-8") as f:
+                      f.write(g)
+                  print("Patch applied successfully!")
+              else:
+                  print("Target function not found!")
           EOF
 
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
+
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.7
+
       - run: gradle assembleDebug
         working-directory: FolderGrab
+
       - uses: actions/upload-artifact@v4
         with:
           name: FolderGrab-debug-apk
