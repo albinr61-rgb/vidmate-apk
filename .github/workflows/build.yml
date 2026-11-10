@@ -24,7 +24,7 @@ jobs:
         with:
           channel: 'stable'
 
-      - name: Create App & Inject Folder Long Press Engine
+      - name: Create App & Inject Universal Video Scraper
         run: |
           flutter create my_downloader --org com.myvidmate.app
           cd my_downloader
@@ -125,21 +125,44 @@ jobs:
                       _searchController.text = url;
                     },
                     onPageFinished: (url) {
-                      // மொபைலில் Touch Long Press & ContextMenu இரண்டையும் துல்லியமாகப் பிடிக்கும் JS
+                      // எந்த வீடியோ இணையதளமாக இருந்தாலும் Video மற்றும் Folder-களைப் பிரித்தறியும் JS
                       _webController.runJavaScript(r"""
                         var touchTimer = null;
                         var isBusy = false;
 
-                        function triggerLongPress(link) {
+                        function isVideo(link) {
+                          var href = (link.href || '').toLowerCase();
+                          var text = (link.innerText + ' ' + (link.getAttribute('aria-label') || '')).toLowerCase();
+                          if (href.includes('watch') || href.includes('youtu.be') || href.includes('video') || 
+                              href.includes('view') || href.includes('play') || href.includes('.mp4') || 
+                              href.includes('clip') || href.includes('movie')) {
+                            return true;
+                          }
+                          if (text.includes('sec') || text.includes('min') || text.includes('360p') || 
+                              text.includes('720p') || text.includes('1080p') || text.includes('hd')) {
+                            return true;
+                          }
+                          if (link.querySelector('img') && (text.match(/\d+:\d+/) || text.match(/\d+\s*min/))) {
+                            return true;
+                          }
+                          return false;
+                        }
+
+                        function triggerLongPress(link, ev) {
                           if (isBusy || !link || !link.href) return;
                           isBusy = true;
                           setTimeout(function() { isBusy = false; }, 1500);
 
-                          var title = link.innerText.trim() || link.getAttribute('aria-label') || link.title || 'Folder';
+                          var img = link.querySelector('img') || (ev.target.tagName === 'IMG' ? ev.target : null);
+                          var thumb = img ? img.src : '';
+                          var title = link.innerText.trim() || (img ? img.alt : '') || link.title || 'Video';
+                          var videoFlag = isVideo(link);
+
                           LongPressDetector.postMessage(JSON.stringify({
-                            type: (link.href.includes('watch') || link.href.includes('youtu.be')) ? 'video' : 'folder',
+                            type: videoFlag ? 'video' : 'folder',
                             url: link.href,
-                            name: title
+                            name: title,
+                            thumb: thumb
                           }));
                         }
 
@@ -147,7 +170,7 @@ jobs:
                           var link = e.target.closest('a');
                           if (link) {
                             e.preventDefault();
-                            triggerLongPress(link);
+                            triggerLongPress(link, e);
                           }
                         }, true);
 
@@ -155,7 +178,7 @@ jobs:
                           var link = e.target.closest('a');
                           if (link) {
                             touchTimer = setTimeout(function() {
-                              triggerLongPress(link);
+                              triggerLongPress(link, e);
                             }, 650);
                           }
                         }, {passive: true});
@@ -163,7 +186,6 @@ jobs:
                         document.addEventListener('touchend', function() {
                           if (touchTimer) clearTimeout(touchTimer);
                         }, {passive: true});
-
                         document.addEventListener('touchmove', function() {
                           if (touchTimer) clearTimeout(touchTimer);
                         }, {passive: true});
@@ -180,17 +202,168 @@ jobs:
                 String type = data['type'];
                 String url = data['url'];
                 String name = data['name'];
+                String thumb = data['thumb'] ?? '';
 
                 if (type == 'video' || url.contains('watch?v=') || url.contains('youtu.be/')) {
-                  _fetchYouTubeInfo(url);
+                  // வீடியோ Long Press செய்யப்படும் போது (YouTube அல்லது எந்த Website வீடியோவாக இருந்தாலும்)
+                  if (url.contains('watch?v=') || url.contains('youtu.be/')) {
+                    _fetchYouTubeInfo(url);
+                  } else {
+                    _fetchWebsiteVideoQualities(url, name, thumb);
+                  }
                 } else {
-                  // நீங்கள் Long Press செய்த தலைப்பின் பெயரிலேயே (Tamil Songs) மெயின் Folder உருவாகும்
                   _onFolderLongPressed(url, name);
                 }
               } catch (_) {}
             }
 
-            // FOLDER LONG PRESS HANDLER: 'Tamil Songs' என்ற பெயரில் Main Folder உருவாக்கும் முறை
+            // எந்த Website-ல் உள்ள வீடியோவிற்கும் Qualities (1080p, 720p, 360p) எடுக்கும் எஞ்சின்
+            Future<void> _fetchWebsiteVideoQualities(String videoPageUrl, String title, String thumbUrl) async {
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("வீடியோ தரம் (Qualities) ஆராயப்படுகிறது...")));
+              setState(() => _isLoading = true);
+
+              try {
+                var dio = _getSafeDio(videoPageUrl);
+                var res = await dio.get(videoPageUrl);
+                String html = res.data.toString();
+
+                Map<String, String> videoQualities = {};
+
+                // 1. HTML5 <source src="..." label="..."> tags
+                final sourceRegex = RegExp(r"""<source[^>]+src=["']([^"']+)["'][^>]*>""", caseSensitive: false);
+                for (var m in sourceRegex.allMatches(html)) {
+                  String tag = m.group(0)!;
+                  String src = m.group(1)!;
+                  String q = "MP4 Video";
+                  if (tag.contains('1080') || src.contains('1080')) q = "1080p HD";
+                  else if (tag.contains('720') || src.contains('720')) q = "720p HD";
+                  else if (tag.contains('480') || src.contains('480')) q = "480p";
+                  else if (tag.contains('360') || src.contains('360')) q = "360p";
+                  else if (tag.contains('240') || src.contains('240')) q = "240p";
+
+                  String fullUrl = src.startsWith('http') ? src : Uri.parse(videoPageUrl).resolve(src).toString();
+                  videoQualities[q] = fullUrl;
+                }
+
+                // 2. Direct MP4 links in scripts / players
+                final mp4Regex = RegExp(r"""["'](https?://[^"'<>\s]+\.(?:mp4|webm)[^"'<>\s]*)["']""", caseSensitive: false);
+                for (var m in mp4Regex.allMatches(html)) {
+                  String src = m.group(1)!;
+                  String q = "720p HD";
+                  if (src.contains('1080')) q = "1080p HD";
+                  else if (src.contains('720')) q = "720p HD";
+                  else if (src.contains('480')) q = "480p";
+                  else if (src.contains('360')) q = "360p";
+                  else if (src.contains('240')) q = "240p";
+                  else if (videoQualities.isNotEmpty) q = "Video (${videoQualities.length + 1})";
+
+                  videoQualities[q] = src;
+                }
+
+                setState(() => _isLoading = false);
+
+                if (videoQualities.isNotEmpty) {
+                  _showWebsiteVideoQualityDialog(title, thumbUrl, videoQualities, videoPageUrl);
+                } else {
+                  // நேரடியாக வீடியோ ஃபைலாக இருந்தால்
+                  if (videoPageUrl.endsWith('.mp4')) {
+                    _showWebsiteVideoQualityDialog(title, thumbUrl, {'Original MP4': videoPageUrl}, videoPageUrl);
+                  } else {
+                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("வீடியோ இணைப்புகள் கிடைக்கவில்லை! வீடியோவை திறந்து இயக்கவும்.")));
+                  }
+                }
+              } catch (e) {
+                setState(() => _isLoading = false);
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Error: $e")));
+              }
+            }
+
+            // பிற Website வீடியோக்களுக்கான Quality Selection Popup
+            void _showWebsiteVideoQualityDialog(String title, String thumb, Map<String, String> qualities, String referer) {
+              String selectedFormat = qualities.keys.first;
+
+              showModalBottomSheet(
+                context: context,
+                isScrollControlled: true,
+                shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+                builder: (context) {
+                  return StatefulBuilder(
+                    builder: (context, setModalState) {
+                      return Container(
+                        padding: const EdgeInsets.all(16),
+                        height: MediaQuery.of(context).size.height * 0.65,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                if (thumb.isNotEmpty)
+                                  ClipRRect(
+                                    borderRadius: BorderRadius.circular(8),
+                                    child: Image.network(thumb, width: 80, height: 60, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const Icon(Icons.video_library, size: 40)),
+                                  )
+                                else
+                                  const Icon(Icons.video_library, size: 50, color: Colors.red),
+                                const SizedBox(width: 12),
+                                Expanded(child: Text(title, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13))),
+                              ],
+                            ),
+                            const Divider(height: 20),
+                            const Text("🎬 Video Qualities", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.red)),
+                            const SizedBox(height: 8),
+                            Expanded(
+                              child: ListView(
+                                children: [
+                                  for (var q in qualities.keys)
+                                    RadioListTile(
+                                      title: Row(
+                                        children: [
+                                          Text(q),
+                                          const Spacer(),
+                                          if (_downloadedQualities[q] == true)
+                                            const Text("✓✓", style: TextStyle(color: Colors.blue, fontWeight: FontWeight.bold)),
+                                        ],
+                                      ),
+                                      value: q,
+                                      groupValue: selectedFormat,
+                                      onChanged: (val) {
+                                        setModalState(() {
+                                          selectedFormat = val.toString();
+                                        });
+                                      },
+                                    ),
+                                ],
+                              ),
+                            ),
+                            SizedBox(
+                              width: double.infinity,
+                              height: 48,
+                              child: ElevatedButton(
+                                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFFF2B42), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(25))),
+                                child: const Text("DOWNLOAD", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
+                                onPressed: () {
+                                  Navigator.pop(context);
+                                  String streamUrl = qualities[selectedFormat]!;
+                                  String cleanTitle = title.replaceAll(RegExp(r'[^\w\s]+'), '').trim();
+                                  if (cleanTitle.isEmpty) cleanTitle = "Video";
+                                  _startFileDownload(streamUrl, "Videos", referer);
+                                  setState(() {
+                                    _downloadedQualities[selectedFormat] = true;
+                                    _currentTab = 2;
+                                  });
+                                },
+                              ),
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  );
+                },
+              );
+            }
+
+            // FOLDER LONG PRESS HANDLER
             Future<void> _onFolderLongPressed(String targetUrl, String folderName) async {
               String rootName = folderName.replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
               if (rootName.isEmpty) rootName = "Tamil Songs";
@@ -202,11 +375,9 @@ jobs:
                 var res = await dio.get(targetUrl);
                 String html = res.data.toString();
 
-                // 1. உள்ளே இருக்கும் நேரடி MP3 பாடல்கள்
                 final mp3Regex = RegExp(r"""[^\s"\'<>\\\/=]+\.mp3""", caseSensitive: false);
                 var directMp3s = mp3Regex.allMatches(html).map((m) => m.group(0)!).toSet().toList();
 
-                // 2. உள்ளே இருக்கும் Subfolders / Albums (Aalayamani, Amaithikaaga...)
                 final linkRegex = RegExp(r"""<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>""", caseSensitive: false, dotAll: true);
                 List<Map<String, String>> subFolders = [];
 
@@ -259,8 +430,6 @@ jobs:
                         onPressed: () {
                           Navigator.pop(ctx);
                           ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("'$rootName' டவுன்லோட் தொடங்குகிறது...")));
-                          
-                          // rootName (Tamil Songs) மெயின் ஃபோல்டராகக் கொண்டு recursive crawl துவங்குகிறது
                           _crawlFolderRecursively(targetUrl, rootName, <String>{}, 0);
                           setState(() => _currentTab = 2);
                         },
@@ -274,7 +443,7 @@ jobs:
               }
             }
 
-            // RECURSIVE ENGINE: Tamil Songs ➔ Aalayamani ➔ பாடல்கள் என கடைசி வரை செல்லும் முறை
+            // RECURSIVE CRAWLER
             Future<void> _crawlFolderRecursively(String currentUrl, String currentPath, Set<String> visited, int depth) async {
               if (depth > 5 || visited.contains(currentUrl)) return;
               visited.add(currentUrl);
@@ -284,7 +453,6 @@ jobs:
                 var res = await dio.get(currentUrl);
                 String html = res.data.toString();
 
-                // 1. இந்த மட்டத்தில் உள்ள பாடல்களை டவுன்லோட் செய்தல்
                 final mp3Regex = RegExp(r"""[^\s"\'<>\\\/=]+\.mp3""", caseSensitive: false);
                 var matches = mp3Regex.allMatches(html);
                 for (var m in matches) {
@@ -293,7 +461,6 @@ jobs:
                   _startFileDownload(fullSongUrl, currentPath, currentUrl);
                 }
 
-                // 2. உள்ளே இருக்கும் அனைத்து Subfolders-களுக்குள்ளும் நுழைதல்
                 final linkRegex = RegExp(r"""<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>""", caseSensitive: false, dotAll: true);
                 for (var m in linkRegex.allMatches(html)) {
                   String href = m.group(1)!;
@@ -301,10 +468,9 @@ jobs:
                   subName = subName.replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
 
                   if (subName.length > 1 && !href.startsWith('#') && !href.startsWith('javascript:')) {
-                    if (!['Home', 'Songs', 'Bible', 'Quiz', 'Search', 'Contact', 'TV', 'Facebook'].contains(subName)) {
+                    if (!['Home', 'Songs', 'Bible', 'Quiz', 'Search', 'Contact', 'TV', 'Facebook', 'About'].contains(subName)) {
                       String nextUrl = href.startsWith('http') ? href : Uri.parse(currentUrl).resolve(href).toString();
                       if (!visited.contains(nextUrl) && !nextUrl.endsWith('.mp3')) {
-                        // எ.கா: Download/Tamil Songs/Aalayamani
                         await _crawlFolderRecursively(nextUrl, "$currentPath/$subName", visited, depth + 1);
                       }
                     }
@@ -315,7 +481,7 @@ jobs:
 
             Future<void> _startFileDownload(String fileUrl, String subfolder, String referer) async {
               String fileName = Uri.decodeComponent(fileUrl.split('/').last.split('?').first);
-              if (fileName.isEmpty || !fileName.contains('.')) fileName = "track_${DateTime.now().millisecondsSinceEpoch}.mp3";
+              if (fileName.isEmpty || !fileName.contains('.')) fileName = "video_${DateTime.now().millisecondsSinceEpoch}.mp4";
 
               CancelToken cancelToken = CancelToken();
               var task = DownloadTask(
@@ -333,7 +499,6 @@ jobs:
                 Directory baseDir = Directory('/storage/emulated/0/Download');
                 if (!await baseDir.exists()) baseDir = (await getExternalStorageDirectory())!;
                 
-                // Nested Folders (Download/Tamil Songs/Aalayamani/) தானாக உருவாகும்
                 Directory targetDir = Directory('${baseDir.path}/$subfolder');
                 if (!await targetDir.exists()) await targetDir.create(recursive: true);
 
