@@ -24,7 +24,7 @@ jobs:
         with:
           channel: 'stable'
 
-      - name: Create App & Inject Precision Code
+      - name: Create App & Inject Multi-Level Album Downloader
         run: |
           flutter create my_downloader --org com.myvidmate.app
           cd my_downloader
@@ -79,6 +79,7 @@ jobs:
             late final WebViewController _webController;
             final TextEditingController _searchController = TextEditingController();
             bool _isLoading = false;
+            bool _isBottomSheetOpen = false;
 
             bool _isDesktopMode = false;
             static const String desktopUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
@@ -111,7 +112,6 @@ jobs:
               _webController = WebViewController()
                 ..setJavaScriptMode(JavaScriptMode.unrestricted)
                 ..setUserAgent(mobileUA)
-                // Video & Folder Long Press நிகழ்வுகளைப் பிடிக்கும் சேனல்
                 ..addJavaScriptChannel(
                   'LongPressDetector',
                   onMessageReceived: (JavaScriptMessage msg) {
@@ -122,17 +122,18 @@ jobs:
                   NavigationDelegate(
                     onPageStarted: (url) {
                       _searchController.text = url;
-                      if (url.contains('watch?v=') || url.contains('youtu.be/')) {
-                        _fetchYouTubeInfo(url);
-                      }
                     },
                     onPageFinished: (url) {
-                      // JavaScript Long Press Injection (YouTube Video & Website Folders)
                       _webController.runJavaScript(r"""
+                        var isBusy = false;
                         document.addEventListener('contextmenu', function(e) {
+                          if (isBusy) return;
                           var link = e.target.closest('a');
                           if (link && link.href) {
                             e.preventDefault();
+                            isBusy = true;
+                            setTimeout(function() { isBusy = false; }, 1200);
+
                             var title = link.innerText.trim() || link.getAttribute('aria-label') || link.title || 'Item';
                             LongPressDetector.postMessage(JSON.stringify({
                               type: (link.href.includes('watch') || link.href.includes('youtu.be')) ? 'video' : 'folder',
@@ -140,7 +141,7 @@ jobs:
                               name: title
                             }));
                           }
-                        });
+                        }, true);
                       """);
                     },
                   ),
@@ -148,7 +149,6 @@ jobs:
                 ..loadRequest(Uri.parse('https://m.youtube.com'));
             }
 
-            // Universal Long Press Handler
             void _handleUniversalLongPress(String jsonStr) {
               try {
                 var data = jsonDecode(jsonStr);
@@ -157,89 +157,156 @@ jobs:
                 String name = data['name'];
 
                 if (type == 'video' || url.contains('watch?v=') || url.contains('youtu.be/')) {
-                  // 2. Video Long Press - தரத்தேர்வு Popup
                   _fetchYouTubeInfo(url);
                 } else {
-                  // 3. Folder Long Press - Files & Subfolder எண்ணிக்கை காட்டுவது
-                  _scanFolderContents(url, name);
+                  _smartCategoryOrAlbumCrawler(url, name);
                 }
               } catch (_) {}
             }
 
-            // 3. Folder & Files எண்ணிக்கையைக் கணக்கிட்டு டவுன்லோட் செய்வது
-            Future<void> _scanFolderContents(String folderUrl, String folderName) async {
-              String cleanName = folderName.replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
-              if (cleanName.isEmpty) cleanName = "Folder";
+            // RECURSIVE MULTI-LEVEL CRAWLER: மெயின் தலைப்பு (Tamil Songs) மற்றும் Albums இரண்டையும் பிரித்தெடுக்கும்
+            Future<void> _smartCategoryOrAlbumCrawler(String targetUrl, String titleName) async {
+              String rootName = titleName.replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
+              if (rootName.isEmpty) rootName = "Tamil Songs";
 
-              ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("'$cleanName' கோப்புகள் கணக்கிடப்படுகின்றன...")));
+              ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("'$rootName' ஆராயப்படுகிறது...")));
 
               try {
-                var dio = _getSafeDio(folderUrl);
-                var res = await dio.get(folderUrl);
+                var dio = _getSafeDio(targetUrl);
+                var res = await dio.get(targetUrl);
                 String html = res.data.toString();
 
-                final fileRegex = RegExp(
-                  r"""(?:href|src)\s*=\s*["']([^"']+\.(?:mp3|m4a|mp4|wav|aac|pdf|zip)[^"']*)["']""",
+                // 1. நேரடி ஆடியோ ஃபைல்கள் உள்ளதா என சோதித்தல்
+                final audioRegex = RegExp(
+                  r"""["'\(]([^"'()\s<>]+\.(?:mp3|m4a|mp4|wav|aac)[^"'()\s<>]*)["'\)]""",
                   caseSensitive: false,
                 );
-                var fileMatches = fileRegex.allMatches(html);
-                List<String> mediaFiles = [];
-
-                for (var m in fileMatches) {
-                  String link = m.group(1)!;
-                  if (!link.startsWith('http')) {
-                    link = Uri.parse(folderUrl).resolve(link).toString();
-                  }
-                  if (!mediaFiles.contains(link)) mediaFiles.add(link);
+                var audioMatches = audioRegex.allMatches(html);
+                List<String> directMedia = [];
+                for (var m in audioMatches) {
+                  String raw = m.group(1)!;
+                  if (raw.contains('?') && !raw.contains('.mp3')) continue;
+                  String full = raw.startsWith('http') ? raw : Uri.parse(targetUrl).resolve(raw).toString();
+                  if (!directMedia.contains(full)) directMedia.add(full);
                 }
 
-                // Subfolders எண்ணிக்கை தேடல்
-                final folderRegex = RegExp(r"""href\s*=\s*["']([^"']*(?:album|folder|dir|\/)[^"']*)["']""", caseSensitive: false);
-                int subFolderCount = folderRegex.allMatches(html).length;
+                // 2. உள்ளே இருக்கும் Sub-Albums (Aalayamani, Amaithikaaga...) இணைப்புகளைத் தேடுதல்
+                final linkRegex = RegExp(r"""<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>""", caseSensitive: false, dotAll: true);
+                Map<String, String> subAlbums = {};
 
-                showDialog(
-                  context: context,
-                  builder: (ctx) => AlertDialog(
-                    title: Row(
-                      children: [
-                        const Icon(Icons.folder_open, color: Colors.amber),
-                        const SizedBox(width: 8),
-                        Expanded(child: Text(cleanName, maxLines: 1, overflow: TextOverflow.ellipsis)),
+                for (var m in linkRegex.allMatches(html)) {
+                  String href = m.group(1)!;
+                  String text = m.group(2)!.replaceAll(RegExp(r'<[^>]*>'), '').trim();
+                  text = text.replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
+
+                  if (text.isNotEmpty && text.length > 2 && !href.startsWith('#') && !href.startsWith('javascript:')) {
+                    if (!['Home', 'Songs', 'Bible', 'Quiz', 'Search', 'Contact', 'Facebook', 'About'].contains(text)) {
+                      String fullUrl = href.startsWith('http') ? href : Uri.parse(targetUrl).resolve(href).toString();
+                      if (fullUrl != targetUrl) {
+                        subAlbums[text] = fullUrl;
+                      }
+                    }
+                  }
+                }
+
+                // A. மெயின் Category (உள்ளே Albums இருந்தால்)
+                if (subAlbums.isNotEmpty && directMedia.isEmpty) {
+                  showDialog(
+                    context: context,
+                    builder: (ctx) => AlertDialog(
+                      title: Row(
+                        children: [
+                          const Icon(Icons.folder_special, color: Colors.amber, size: 28),
+                          const SizedBox(width: 8),
+                          Expanded(child: Text(rootName, style: const TextStyle(fontWeight: FontWeight.bold))),
+                        ],
+                      ),
+                      content: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text("📁 ${subAlbums.length} Albums கண்டறியப்பட்டன!", style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.blue)),
+                          const SizedBox(height: 6),
+                          Text("உதாரணம்: ${subAlbums.keys.take(3).join(', ')}..."),
+                          const SizedBox(height: 12),
+                          Text("Download/$rootName/ என்ற Main Folder-க்குள் அனைத்து Albums-களையும் தனித்தனி Subfolder-ஆக உருவாக்கி அத்தனை பாடல்களையும் டவுன்லோட் செய்யவா?"),
+                        ],
+                      ),
+                      actions: [
+                        TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
+                        ElevatedButton(
+                          style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                          onPressed: () {
+                            Navigator.pop(ctx);
+                            _crawlAndDownloadAllSubAlbums(rootName, subAlbums);
+                            setState(() => _currentTab = 2);
+                          },
+                          child: Text("Download All (${subAlbums.length} Albums)", style: const TextStyle(color: Colors.white)),
+                        )
                       ],
                     ),
-                    content: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text("📁 Subfolders: ${subFolderCount > 0 ? subFolderCount : 'Direct'}"),
-                        const SizedBox(height: 6),
-                        Text("🎵 Files / Songs Found: ${mediaFiles.length}", style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.blue)),
-                        const SizedBox(height: 12),
-                        const Text("இவை அனைத்தையும் இதே பெயரில் Subfolder உருவாக்கி டவுன்லோட் செய்யவா?"),
+                  );
+                } 
+                // B. ஒற்றை Album (நேரடிப் பாடல்கள் இருந்தால்)
+                else if (directMedia.isNotEmpty) {
+                  showDialog(
+                    context: context,
+                    builder: (ctx) => AlertDialog(
+                      title: Text("📁 $rootName Album"),
+                      content: Text("இந்த Album-ல் ${directMedia.length} பாடல்கள் உள்ளன! அனைத்தையும் Download/$rootName/ ஃபோல்டரில் டவுன்லோட் செய்யவா?"),
+                      actions: [
+                        TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
+                        ElevatedButton(
+                          style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                          onPressed: () {
+                            Navigator.pop(ctx);
+                            for (var song in directMedia) {
+                              _startFileDownload(song, rootName, targetUrl);
+                            }
+                            setState(() => _currentTab = 2);
+                          },
+                          child: Text("Download All (${directMedia.length})", style: const TextStyle(color: Colors.white)),
+                        )
                       ],
                     ),
-                    actions: [
-                      TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
-                      ElevatedButton(
-                        style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-                        onPressed: () {
-                          Navigator.pop(ctx);
-                          if (mediaFiles.isEmpty) {
-                            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("கோப்புகள் எதுவும் இல்லை!")));
-                            return;
-                          }
-                          for (var fUrl in mediaFiles) {
-                            _startFileDownload(fUrl, cleanName, folderUrl);
-                          }
-                          setState(() => _currentTab = 2);
-                        },
-                        child: Text("Download All (${mediaFiles.length})", style: const TextStyle(color: Colors.white)),
-                      )
-                    ],
-                  ),
-                );
+                  );
+                } else {
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("பாடல்கள் எதுவும் கண்டறியப்படவில்லை!")));
+                }
               } catch (e) {
                 ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Error: $e")));
+              }
+            }
+
+            // ஒவ்வொரு Album-க்குள்ளும் சென்று பாடல்களை எடுத்து Subfolder-ல் போடும் எஞ்சின்
+            Future<void> _crawlAndDownloadAllSubAlbums(String parentFolder, Map<String, String> albums) async {
+              ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("'$parentFolder' அணைத்து Albums-களும் டவுன்லோட் செய்யப்படுகின்றன...")));
+
+              for (var entry in albums.entries) {
+                String albumName = entry.key;
+                String albumUrl = entry.value;
+
+                try {
+                  var dio = _getSafeDio(albumUrl);
+                  var res = await dio.get(albumUrl);
+                  String html = res.data.toString();
+
+                  final audioRegex = RegExp(
+                    r"""["'\(]([^"'()\s<>]+\.(?:mp3|m4a|mp4|wav|aac)[^"'()\s<>]*)["'\)]""",
+                    caseSensitive: false,
+                  );
+                  var matches = audioRegex.allMatches(html);
+
+                  for (var m in matches) {
+                    String raw = m.group(1)!;
+                    if (raw.contains('?') && !raw.contains('.mp3')) continue;
+                    String fullSongUrl = raw.startsWith('http') ? raw : Uri.parse(albumUrl).resolve(raw).toString();
+
+                    // மெயின் போல்டர் / சப்-போல்டர் அமைப்பு (எ.கா: Tamil Songs/Aalayamani)
+                    String subfolderPath = "$parentFolder/$albumName";
+                    _startFileDownload(fullSongUrl, subfolderPath, albumUrl);
+                  }
+                } catch (_) {}
               }
             }
 
@@ -249,7 +316,7 @@ jobs:
 
               CancelToken cancelToken = CancelToken();
               var task = DownloadTask(
-                id: DateTime.now().millisecondsSinceEpoch.toString(),
+                id: DateTime.now().millisecondsSinceEpoch.toString() + fileUrl.hashCode.toString(),
                 name: fileName,
                 subfolder: subfolder,
                 cancelToken: cancelToken,
@@ -263,6 +330,7 @@ jobs:
                 Directory baseDir = Directory('/storage/emulated/0/Download');
                 if (!await baseDir.exists()) baseDir = (await getExternalStorageDirectory())!;
                 
+                // Nested Subfolder உருவாக்கம்: Download/Tamil Songs/Aalayamani/
                 Directory targetDir = Directory('${baseDir.path}/$subfolder');
                 if (!await targetDir.exists()) await targetDir.create(recursive: true);
 
@@ -295,29 +363,35 @@ jobs:
               }
             }
 
-            // 2. Video Quality BottomSheet
             void _fetchYouTubeInfo(String url) async {
-              setState(() => _isLoading = true);
+              if (_isBottomSheetOpen || _isLoading) return;
+              _isBottomSheetOpen = true;
+              _isLoading = true;
+              setState(() {});
+
               var yt = YoutubeExplode();
               try {
                 var video = await yt.videos.get(url);
                 var manifest = await yt.videos.streamsClient.getManifest(video.id);
-                setState(() => _isLoading = false);
-                _showYouTubeQualityDialog(video, manifest);
+                _isLoading = false;
+                setState(() {});
+                await _showYouTubeQualityDialog(video, manifest);
               } catch (_) {
-                setState(() => _isLoading = false);
+                _isLoading = false;
+                setState(() {});
               } finally {
                 yt.close();
+                _isBottomSheetOpen = false;
               }
             }
 
-            void _showYouTubeQualityDialog(Video video, StreamManifest manifest) {
+            Future<void> _showYouTubeQualityDialog(Video video, StreamManifest manifest) async {
               String selectedFormat = '720p';
               dynamic selectedStream;
               var muxedStreams = manifest.muxed;
               var audioStreams = manifest.audioOnly;
 
-              showModalBottomSheet(
+              await showModalBottomSheet(
                 context: context,
                 isScrollControlled: true,
                 shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
@@ -453,6 +527,26 @@ jobs:
               }
             }
 
+            Future<void> _toggleBookmark() async {
+              String? currentUrl = await _webController.currentUrl();
+              String? title = await _webController.getTitle();
+              if (currentUrl == null) return;
+
+              final prefs = await SharedPreferences.getInstance();
+              bool exists = _bookmarks.any((b) => b['url'] == currentUrl);
+
+              setState(() {
+                if (exists) {
+                  _bookmarks.removeWhere((b) => b['url'] == currentUrl);
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Bookmark Removed! ❌")));
+                } else {
+                  _bookmarks.add({'title': title ?? 'Page', 'url': currentUrl});
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Bookmarked! ⭐")));
+                }
+              });
+              await prefs.setString('saved_bookmarks', jsonEncode(_bookmarks));
+            }
+
             Future<void> _loadDownloadedFiles() async {
               try {
                 Directory dir = Directory('/storage/emulated/0/Download');
@@ -475,13 +569,14 @@ jobs:
                   backgroundColor: Colors.white,
                   elevation: 1,
                   title: Container(
-                    height: 40,
+                    height: 38,
                     decoration: BoxDecoration(color: Colors.grey[200], borderRadius: BorderRadius.circular(20)),
                     child: TextField(
                       controller: _searchController,
+                      style: const TextStyle(fontSize: 14),
                       decoration: const InputDecoration(
                         hintText: "Search or enter URL...",
-                        prefixIcon: Icon(Icons.search, size: 20, color: Colors.grey),
+                        prefixIcon: Icon(Icons.search, size: 18, color: Colors.grey),
                         border: InputBorder.none,
                         contentPadding: EdgeInsets.only(top: 8),
                       ),
@@ -494,13 +589,30 @@ jobs:
                   ),
                   actions: [
                     IconButton(
-                      icon: Icon(Icons.desktop_windows, color: _isDesktopMode ? Colors.blue : Colors.black87),
+                      icon: Icon(Icons.desktop_windows, size: 21, color: _isDesktopMode ? Colors.blue : Colors.black87),
+                      tooltip: "Desktop Mode",
                       onPressed: () async {
                         setState(() => _isDesktopMode = !_isDesktopMode);
                         await _webController.setUserAgent(_isDesktopMode ? desktopUA : mobileUA);
                         await _webController.reload();
                       },
                     ),
+                    IconButton(
+                      icon: const Icon(Icons.add_box_outlined, size: 21, color: Colors.black87),
+                      tooltip: "New Tab",
+                      onPressed: () {
+                        _searchController.clear();
+                        _webController.loadRequest(Uri.parse('https://www.google.com'));
+                        setState(() => _currentTab = 0);
+                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("New Page Opened! 🌐")));
+                      },
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.star_border, size: 22, color: Colors.amber),
+                      tooltip: "Bookmark",
+                      onPressed: _toggleBookmark,
+                    ),
+                    const SizedBox(width: 4),
                   ],
                 ),
                 body: IndexedStack(
@@ -559,7 +671,7 @@ jobs:
                                               children: [
                                                 Text(t.name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.bold)),
                                                 const SizedBox(height: 4),
-                                                Text("Folder: ${t.subfolder}", style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                                                Text("📁 Folder: ${t.subfolder}", style: const TextStyle(fontSize: 12, color: Colors.blue)),
                                                 const SizedBox(height: 8),
                                                 LinearProgressIndicator(value: t.progress > 0 ? t.progress : null, color: Colors.red),
                                                 const SizedBox(height: 6),
@@ -579,6 +691,7 @@ jobs:
                                         return ListTile(
                                           leading: const Icon(Icons.music_video, color: Colors.red),
                                           title: Text(f.path.split('/').last, maxLines: 1),
+                                          subtitle: Text(f.path.replaceFirst('/storage/emulated/0/Download/', '')),
                                           trailing: IconButton(
                                             icon: const Icon(Icons.delete, color: Colors.grey),
                                             onPressed: () {
@@ -606,7 +719,7 @@ jobs:
                             if (u.contains('watch') || u.contains('youtu.be')) {
                               _fetchYouTubeInfo(u);
                             } else {
-                              _scanFolderContents(u, "Downloads");
+                              _smartCategoryOrAlbumCrawler(u, "Downloads");
                             }
                           }
                         },
