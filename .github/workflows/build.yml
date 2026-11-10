@@ -28,15 +28,15 @@ jobs:
         run: |
           flutter create my_downloader --org com.myvidmate.app
           cd my_downloader
-          flutter pub add youtube_explode_dart dio path_provider permission_handler
+          
+          # SDK 37 பிரச்சனை தரும் permission_handler நீக்கப்பட்டுவிட்டது
+          flutter pub add youtube_explode_dart dio path_provider
 
-          # Flutter Code-ஐ நேரடியாக உருவாக்குகிறது
           cat << 'EOF' > lib/main.dart
           import 'dart:io';
           import 'package:flutter/material.dart';
           import 'package:youtube_explode_dart/youtube_explode_dart.dart';
           import 'package:path_provider/path_provider.dart';
-          import 'package:permission_handler/permission_handler.dart';
 
           void main() {
             runApp(const MaterialApp(
@@ -169,14 +169,19 @@ jobs:
             }
 
             Future<void> _startDownload(Video video, dynamic streamInfo) async {
-              await Permission.storage.request();
-              var yt = YoutubeExplode();
               ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Downloading started...")));
 
+              var yt = YoutubeExplode();
               var stream = yt.videos.streamsClient.get(streamInfo);
-              var dir = await getExternalStorageDirectory();
+
+              // Download Folder தேர்வு செய்கிறோம்
+              Directory dir = Directory('/storage/emulated/0/Download');
+              if (!await dir.exists()) {
+                dir = (await getExternalStorageDirectory())!;
+              }
+
               var cleanTitle = video.title.replaceAll(RegExp(r'[^\w\s]+'), '');
-              var file = File('${dir!.path}/$cleanTitle.mp4');
+              var file = File('${dir.path}/$cleanTitle.mp4');
 
               var fileStream = file.openWrite();
               await stream.pipe(fileStream);
@@ -229,8 +234,9 @@ jobs:
           }
           EOF
 
-          # Add Permissions
+          # Internet மற்றும் Storage Permissions சேர்க்கப்படுகிறது
           sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>' android/app/src/main/AndroidManifest.xml
+          sed -i 's/<application/<application android:requestLegacyExternalStorage="true"/' android/app/src/main/AndroidManifest.xml
 
       - name: Build Release APK
         run: |
