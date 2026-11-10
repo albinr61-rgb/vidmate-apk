@@ -24,12 +24,7 @@ jobs:
         with:
           channel: 'stable'
 
-      - name: Configure Permanent Signing Keystore (For Direct App Updates)
-        run: |
-          mkdir -p ~/.android
-          curl -L -o ~/.android/debug.keystore https://raw.githubusercontent.com/CoreProc/android-debug-keystore/master/debug.keystore
-
-      - name: Create App & Inject Smart Downloader Code
+      - name: Create App & Inject Precision Code
         run: |
           flutter create my_downloader --org com.myvidmate.app
           cd my_downloader
@@ -85,7 +80,6 @@ jobs:
             final TextEditingController _searchController = TextEditingController();
             bool _isLoading = false;
 
-            // Desktop Mode State & User Agents
             bool _isDesktopMode = false;
             static const String desktopUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
             static const String mobileUA = "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36";
@@ -95,13 +89,11 @@ jobs:
             Map<String, bool> _downloadedQualities = {};
             List<FileSystemEntity> _downloadedFiles = [];
 
-            // 403 Forbidden பிழையைத் தடுக்கும் Real Browser Client
             Dio _getSafeDio(String refererUrl) {
               return Dio(BaseOptions(
                 headers: {
                   'User-Agent': _isDesktopMode ? desktopUA : mobileUA,
-                  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                  'Accept-Language': 'en-US,en;q=0.9',
+                  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                   'Referer': refererUrl,
                 },
                 followRedirects: true,
@@ -119,26 +111,34 @@ jobs:
               _webController = WebViewController()
                 ..setJavaScriptMode(JavaScriptMode.unrestricted)
                 ..setUserAgent(mobileUA)
+                // Video & Folder Long Press நிகழ்வுகளைப் பிடிக்கும் சேனல்
                 ..addJavaScriptChannel(
-                  'FolderDownloader',
-                  onMessageReceived: (JavaScriptMessage message) {
-                    _handleFolderLongPress(message.message);
+                  'LongPressDetector',
+                  onMessageReceived: (JavaScriptMessage msg) {
+                    _handleUniversalLongPress(msg.message);
                   },
                 )
                 ..setNavigationDelegate(
                   NavigationDelegate(
                     onPageStarted: (url) {
                       _searchController.text = url;
-                      _autoDetectYouTube(url);
+                      if (url.contains('watch?v=') || url.contains('youtu.be/')) {
+                        _fetchYouTubeInfo(url);
+                      }
                     },
                     onPageFinished: (url) {
+                      // JavaScript Long Press Injection (YouTube Video & Website Folders)
                       _webController.runJavaScript(r"""
                         document.addEventListener('contextmenu', function(e) {
-                          var target = e.target.closest('a');
-                          if (target && target.href) {
+                          var link = e.target.closest('a');
+                          if (link && link.href) {
                             e.preventDefault();
-                            var fName = target.innerText.trim() || target.pathname.split('/').filter(Boolean).pop() || 'Folder';
-                            FolderDownloader.postMessage(JSON.stringify({url: target.href, name: fName}));
+                            var title = link.innerText.trim() || link.getAttribute('aria-label') || link.title || 'Item';
+                            LongPressDetector.postMessage(JSON.stringify({
+                              type: (link.href.includes('watch') || link.href.includes('youtu.be')) ? 'video' : 'folder',
+                              url: link.href,
+                              name: title
+                            }));
                           }
                         });
                       """);
@@ -148,123 +148,96 @@ jobs:
                 ..loadRequest(Uri.parse('https://m.youtube.com'));
             }
 
-            // Desktop Mode Toggle
-            Future<void> _toggleDesktopMode() async {
-              setState(() {
-                _isDesktopMode = !_isDesktopMode;
-              });
-              await _webController.setUserAgent(_isDesktopMode ? desktopUA : mobileUA);
-              await _webController.reload();
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(content: Text(_isDesktopMode ? "Desktop Mode ON 💻" : "Mobile Mode ON 📱")),
-              );
-            }
-
-            Future<void> _loadBookmarks() async {
-              final prefs = await SharedPreferences.getInstance();
-              final String? data = prefs.getString('saved_bookmarks');
-              if (data != null) {
-                setState(() {
-                  _bookmarks = List<Map<String, String>>.from(
-                    (jsonDecode(data) as List).map((item) => Map<String, String>.from(item)),
-                  );
-                });
-              }
-            }
-
-            Future<void> _toggleBookmark() async {
-              String? currentUrl = await _webController.currentUrl();
-              String? title = await _webController.getTitle();
-              if (currentUrl == null) return;
-
-              final prefs = await SharedPreferences.getInstance();
-              bool exists = _bookmarks.any((b) => b['url'] == currentUrl);
-
-              setState(() {
-                if (exists) {
-                  _bookmarks.removeWhere((b) => b['url'] == currentUrl);
-                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Bookmark Removed! ❌")));
-                } else {
-                  _bookmarks.add({'title': title ?? 'Page', 'url': currentUrl});
-                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Bookmarked! ⭐")));
-                }
-              });
-              await prefs.setString('saved_bookmarks', jsonEncode(_bookmarks));
-            }
-
-            Future<void> _loadDownloadedFiles() async {
+            // Universal Long Press Handler
+            void _handleUniversalLongPress(String jsonStr) {
               try {
-                Directory dir = Directory('/storage/emulated/0/Download');
-                if (!await dir.exists()) dir = (await getExternalStorageDirectory())!;
-                if (await dir.exists()) {
-                  setState(() {
-                    _downloadedFiles = dir.listSync(recursive: true).where((f) {
-                      String ext = f.path.split('.').last.toLowerCase();
-                      return ['mp4', 'mp3', 'm4a', 'wav', 'aac'].contains(ext);
-                    }).toList();
-                  });
+                var data = jsonDecode(jsonStr);
+                String type = data['type'];
+                String url = data['url'];
+                String name = data['name'];
+
+                if (type == 'video' || url.contains('watch?v=') || url.contains('youtu.be/')) {
+                  // 2. Video Long Press - தரத்தேர்வு Popup
+                  _fetchYouTubeInfo(url);
+                } else {
+                  // 3. Folder Long Press - Files & Subfolder எண்ணிக்கை காட்டுவது
+                  _scanFolderContents(url, name);
                 }
               } catch (_) {}
             }
 
-            // Folder Long Press (403 பிழை வராமல் Browser Headers உடன் இயங்குகிறது)
-            Future<void> _handleFolderLongPress(String jsonStr) async {
+            // 3. Folder & Files எண்ணிக்கையைக் கணக்கிட்டு டவுன்லோட் செய்வது
+            Future<void> _scanFolderContents(String folderUrl, String folderName) async {
+              String cleanName = folderName.replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
+              if (cleanName.isEmpty) cleanName = "Folder";
+
+              ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("'$cleanName' கோப்புகள் கணக்கிடப்படுகின்றன...")));
+
               try {
-                var data = jsonDecode(jsonStr);
-                String folderUrl = data['url'];
-                String folderName = data['name'].replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
-
-                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("'$folderName' ஆராயப்படுகிறது...")));
-
-                // Browser Headers உடன் Server-க்கு Request அனுப்புகிறோம்
                 var dio = _getSafeDio(folderUrl);
-                var response = await dio.get(folderUrl);
-                String html = response.data.toString();
+                var res = await dio.get(folderUrl);
+                String html = res.data.toString();
 
-                final regex = RegExp(
-                  r"""(?:href|src)\s*=\s*["']([^"']+\.(?:mp3|m4a|mp4|wav|aac)[^"']*)["']""",
+                final fileRegex = RegExp(
+                  r"""(?:href|src)\s*=\s*["']([^"']+\.(?:mp3|m4a|mp4|wav|aac|pdf|zip)[^"']*)["']""",
                   caseSensitive: false,
                 );
-                var matches = regex.allMatches(html);
-                List<String> mediaUrls = [];
+                var fileMatches = fileRegex.allMatches(html);
+                List<String> mediaFiles = [];
 
-                for (var m in matches) {
+                for (var m in fileMatches) {
                   String link = m.group(1)!;
                   if (!link.startsWith('http')) {
                     link = Uri.parse(folderUrl).resolve(link).toString();
                   }
-                  if (!mediaUrls.contains(link)) mediaUrls.add(link);
+                  if (!mediaFiles.contains(link)) mediaFiles.add(link);
                 }
 
-                if (mediaUrls.isNotEmpty) {
-                  showDialog(
-                    context: context,
-                    builder: (ctx) => AlertDialog(
-                      title: Text("📁 $folderName Album"),
-                      content: Text("இந்த Album-ல் ${mediaUrls.length} பாடல்கள் கண்டறியப்பட்டுள்ளன! அனைத்தையும் Subfolder-ல் டவுன்லோட் செய்யவா?"),
-                      actions: [
-                        TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
-                        ElevatedButton(
-                          style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-                          onPressed: () {
-                            Navigator.pop(ctx);
-                            for (var songUrl in mediaUrls) {
-                              _startFileDownload(songUrl, folderName, folderUrl);
-                            }
-                            setState(() => _currentTab = 2);
-                          },
-                          child: Text("Download All (${mediaUrls.length})", style: const TextStyle(color: Colors.white)),
-                        )
+                // Subfolders எண்ணிக்கை தேடல்
+                final folderRegex = RegExp(r"""href\s*=\s*["']([^"']*(?:album|folder|dir|\/)[^"']*)["']""", caseSensitive: false);
+                int subFolderCount = folderRegex.allMatches(html).length;
+
+                showDialog(
+                  context: context,
+                  builder: (ctx) => AlertDialog(
+                    title: Row(
+                      children: [
+                        const Icon(Icons.folder_open, color: Colors.amber),
+                        const SizedBox(width: 8),
+                        Expanded(child: Text(cleanName, maxLines: 1, overflow: TextOverflow.ellipsis)),
                       ],
                     ),
-                  );
-                } else {
-                  if (folderUrl.endsWith('.mp3') || folderUrl.endsWith('.mp4')) {
-                    _startFileDownload(folderUrl, folderName, folderUrl);
-                  } else {
-                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("நேரடிப் பாடல்கள் இல்லை. Folder-ஐ தொட்டு உள்ளே சென்று சிவப்பு Download பட்டனை அழுத்தவும்!")));
-                  }
-                }
+                    content: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text("📁 Subfolders: ${subFolderCount > 0 ? subFolderCount : 'Direct'}"),
+                        const SizedBox(height: 6),
+                        Text("🎵 Files / Songs Found: ${mediaFiles.length}", style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.blue)),
+                        const SizedBox(height: 12),
+                        const Text("இவை அனைத்தையும் இதே பெயரில் Subfolder உருவாக்கி டவுன்லோட் செய்யவா?"),
+                      ],
+                    ),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
+                      ElevatedButton(
+                        style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                        onPressed: () {
+                          Navigator.pop(ctx);
+                          if (mediaFiles.isEmpty) {
+                            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("கோப்புகள் எதுவும் இல்லை!")));
+                            return;
+                          }
+                          for (var fUrl in mediaFiles) {
+                            _startFileDownload(fUrl, cleanName, folderUrl);
+                          }
+                          setState(() => _currentTab = 2);
+                        },
+                        child: Text("Download All (${mediaFiles.length})", style: const TextStyle(color: Colors.white)),
+                      )
+                    ],
+                  ),
+                );
               } catch (e) {
                 ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Error: $e")));
               }
@@ -272,7 +245,7 @@ jobs:
 
             Future<void> _startFileDownload(String fileUrl, String subfolder, String referer) async {
               String fileName = Uri.decodeComponent(fileUrl.split('/').last.split('?').first);
-              if (fileName.isEmpty || !fileName.contains('.')) fileName = "song_${DateTime.now().millisecondsSinceEpoch}.mp3";
+              if (fileName.isEmpty || !fileName.contains('.')) fileName = "track_${DateTime.now().millisecondsSinceEpoch}.mp3";
 
               CancelToken cancelToken = CancelToken();
               var task = DownloadTask(
@@ -322,12 +295,7 @@ jobs:
               }
             }
 
-            void _autoDetectYouTube(String url) {
-              if (url.contains('watch?v=') || url.contains('youtu.be/') || url.contains('/shorts/')) {
-                _fetchYouTubeInfo(url);
-              }
-            }
-
+            // 2. Video Quality BottomSheet
             void _fetchYouTubeInfo(String url) async {
               setState(() => _isLoading = true);
               var yt = YoutubeExplode();
@@ -475,69 +443,29 @@ jobs:
               ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("✅ Saved $quality (✓✓)!")));
             }
 
-            Future<void> _scanCurrentPageForMedia() async {
-              String? currentUrl = await _webController.currentUrl();
-              if (currentUrl == null) return;
-
-              if (currentUrl.contains('youtube.com') || currentUrl.contains('youtu.be')) {
-                _fetchYouTubeInfo(currentUrl);
-              } else {
-                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("பாடல்கள் தேடப்படுகின்றன...")));
-                var result = await _webController.runJavaScriptReturningResult(r"""
-                  (function() {
-                    var links = [];
-                    var pattern = /\.(mp3|m4a|mp4|wav|aac)(\?.*)?$/i;
-                    document.querySelectorAll('a, audio, source').forEach(function(el) {
-                      var src = el.href || el.src;
-                      if (src && pattern.test(src)) {
-                        links.push(src);
-                      }
-                    });
-                    return JSON.stringify(Array.from(new Set(links)));
-                  })()
-                """);
-
-                if (result != null) {
-                  try {
-                    var decoded = jsonDecode(result.toString());
-                    if (decoded is String) decoded = jsonDecode(decoded);
-                    List<dynamic> urls = decoded is List ? decoded : [];
-
-                    if (urls.isNotEmpty) {
-                      showDialog(
-                        context: context,
-                        builder: (ctx) => AlertDialog(
-                          title: const Text("🎵 Media Found!"),
-                          content: Text("இந்தப் பக்கத்தில் ${urls.length} பாடல்கள் உள்ளன. அனைத்தையும் டவுன்லோட் செய்யவா?"),
-                          actions: [
-                            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
-                            ElevatedButton(
-                              onPressed: () {
-                                Navigator.pop(ctx);
-                                for (var u in urls) {
-                                  _startFileDownload(u.toString(), "Website_Downloads", currentUrl);
-                                }
-                                setState(() => _currentTab = 2);
-                              },
-                              child: const Text("Download All"),
-                            )
-                          ],
-                        ),
-                      );
-                    } else {
-                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("பாடல்கள் எதுவும் கிடைக்கவில்லை!")));
-                    }
-                  } catch (_) {}
-                }
+            Future<void> _loadBookmarks() async {
+              final prefs = await SharedPreferences.getInstance();
+              final String? data = prefs.getString('saved_bookmarks');
+              if (data != null) {
+                setState(() {
+                  _bookmarks = List<Map<String, String>>.from((jsonDecode(data) as List).map((i) => Map<String, String>.from(i)));
+                });
               }
             }
 
-            void _navigate(String input) {
-              String target = input.trim();
-              if (!target.startsWith('http://') && !target.startsWith('https://')) {
-                target = 'https://m.youtube.com/results?search_query=${Uri.encodeComponent(target)}';
-              }
-              _webController.loadRequest(Uri.parse(target));
+            Future<void> _loadDownloadedFiles() async {
+              try {
+                Directory dir = Directory('/storage/emulated/0/Download');
+                if (!await dir.exists()) dir = (await getExternalStorageDirectory())!;
+                if (await dir.exists()) {
+                  setState(() {
+                    _downloadedFiles = dir.listSync(recursive: true).where((f) {
+                      String ext = f.path.split('.').last.toLowerCase();
+                      return ['mp4', 'mp3', 'm4a', 'wav', 'aac'].contains(ext);
+                    }).toList();
+                  });
+                }
+              } catch (_) {}
             }
 
             @override
@@ -551,41 +479,30 @@ jobs:
                     decoration: BoxDecoration(color: Colors.grey[200], borderRadius: BorderRadius.circular(20)),
                     child: TextField(
                       controller: _searchController,
-                      decoration: InputDecoration(
-                        hintText: "Search or type URL...",
-                        prefixIcon: const Icon(Icons.search, size: 20, color: Colors.grey),
-                        suffixIcon: IconButton(icon: const Icon(Icons.arrow_forward, size: 18, color: Colors.red), onPressed: () => _navigate(_searchController.text)),
+                      decoration: const InputDecoration(
+                        hintText: "Search or enter URL...",
+                        prefixIcon: Icon(Icons.search, size: 20, color: Colors.grey),
                         border: InputBorder.none,
-                        contentPadding: const EdgeInsets.only(top: 8),
+                        contentPadding: EdgeInsets.only(top: 8),
                       ),
-                      onSubmitted: _navigate,
+                      onSubmitted: (url) {
+                        String target = url.trim();
+                        if (!target.startsWith('http')) target = 'https://m.youtube.com/results?search_query=${Uri.encodeComponent(target)}';
+                        _webController.loadRequest(Uri.parse(target));
+                      },
                     ),
                   ),
                   actions: [
-                    // Desktop Mode Button (💻)
                     IconButton(
-                      icon: Icon(
-                        Icons.desktop_windows,
-                        color: _isDesktopMode ? Colors.blue : Colors.black87,
-                      ),
-                      tooltip: _isDesktopMode ? "Desktop Mode: ON" : "Desktop Mode: OFF",
-                      onPressed: _toggleDesktopMode,
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.add_box_outlined, color: Colors.black87),
-                      onPressed: () {
-                        _searchController.clear();
-                        _webController.loadRequest(Uri.parse('https://www.google.com'));
-                        setState(() => _currentTab = 0);
+                      icon: Icon(Icons.desktop_windows, color: _isDesktopMode ? Colors.blue : Colors.black87),
+                      onPressed: () async {
+                        setState(() => _isDesktopMode = !_isDesktopMode);
+                        await _webController.setUserAgent(_isDesktopMode ? desktopUA : mobileUA);
+                        await _webController.reload();
                       },
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.star_border, color: Colors.amber),
-                      onPressed: _toggleBookmark,
                     ),
                   ],
                 ),
-
                 body: IndexedStack(
                   index: _currentTab,
                   children: [
@@ -595,7 +512,6 @@ jobs:
                         if (_isLoading) const Center(child: CircularProgressIndicator(color: Colors.red)),
                       ],
                     ),
-
                     _bookmarks.isEmpty
                         ? const Center(child: Text("Bookmark எதுவும் இல்லை! ⭐"))
                         : ListView.builder(
@@ -603,14 +519,12 @@ jobs:
                             itemBuilder: (ctx, i) => ListTile(
                               leading: const Icon(Icons.bookmark, color: Colors.amber),
                               title: Text(_bookmarks[i]['title'] ?? '', maxLines: 1),
-                              subtitle: Text(_bookmarks[i]['url'] ?? '', maxLines: 1),
                               onTap: () {
                                 _webController.loadRequest(Uri.parse(_bookmarks[i]['url']!));
                                 setState(() => _currentTab = 0);
                               },
                             ),
                           ),
-
                     Column(
                       children: [
                         Container(
@@ -631,11 +545,11 @@ jobs:
                             controller: _downloadTabController,
                             children: [
                               _activeTasks.isEmpty
-                                  ? const Center(child: Text("தற்போது எதுவும் டவுன்லோட் ஆகவில்லை!"))
+                                  ? const Center(child: Text("டவுன்லோட் எதுவும் இல்லை!"))
                                   : ListView.builder(
                                       itemCount: _activeTasks.length,
                                       itemBuilder: (ctx, i) {
-                                        var task = _activeTasks[i];
+                                        var t = _activeTasks[i];
                                         return Card(
                                           margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                                           child: Padding(
@@ -643,47 +557,32 @@ jobs:
                                             child: Column(
                                               crossAxisAlignment: CrossAxisAlignment.start,
                                               children: [
-                                                Text(task.name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.bold)),
+                                                Text(t.name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.bold)),
                                                 const SizedBox(height: 4),
-                                                Text("Folder: ${task.subfolder}", style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                                                Text("Folder: ${t.subfolder}", style: const TextStyle(fontSize: 12, color: Colors.grey)),
                                                 const SizedBox(height: 8),
-                                                LinearProgressIndicator(value: task.progress > 0 ? task.progress : null, color: Colors.red),
+                                                LinearProgressIndicator(value: t.progress > 0 ? t.progress : null, color: Colors.red),
                                                 const SizedBox(height: 6),
-                                                Row(
-                                                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                                  children: [
-                                                    Text("${(task.progress * 100).toStringAsFixed(1)}%"),
-                                                    IconButton(
-                                                      icon: const Icon(Icons.cancel, color: Colors.grey, size: 20),
-                                                      onPressed: () {
-                                                        task.cancelToken?.cancel();
-                                                        setState(() => _activeTasks.remove(task));
-                                                      },
-                                                    )
-                                                  ],
-                                                )
+                                                Text("${(t.progress * 100).toStringAsFixed(1)}%"),
                                               ],
                                             ),
                                           ),
                                         );
                                       },
                                     ),
-
                               _downloadedFiles.isEmpty
-                                  ? const Center(child: Text("டவுன்லோட் முடிந்த கோப்புகள் இல்லை!"))
+                                  ? const Center(child: Text("கோப்புகள் இல்லை!"))
                                   : ListView.builder(
                                       itemCount: _downloadedFiles.length,
                                       itemBuilder: (ctx, i) {
-                                        var file = _downloadedFiles[i];
-                                        String name = file.path.split('/').last;
+                                        var f = _downloadedFiles[i];
                                         return ListTile(
                                           leading: const Icon(Icons.music_video, color: Colors.red),
-                                          title: Text(name, maxLines: 2, style: const TextStyle(fontSize: 13)),
-                                          subtitle: Text("${(file.statSync().size / (1024 * 1024)).toStringAsFixed(2)} MB"),
+                                          title: Text(f.path.split('/').last, maxLines: 1),
                                           trailing: IconButton(
                                             icon: const Icon(Icons.delete, color: Colors.grey),
                                             onPressed: () {
-                                              file.deleteSync();
+                                              f.deleteSync();
                                               _loadDownloadedFiles();
                                             },
                                           ),
@@ -692,46 +591,28 @@ jobs:
                                     ),
                             ],
                           ),
-                        ),
+                        )
                       ],
                     ),
-
-                    ListView(
-                      padding: const EdgeInsets.all(16),
-                      children: [
-                        const ListTile(
-                          leading: Icon(Icons.folder, color: Colors.blue),
-                          title: Text("Download Path"),
-                          subtitle: Text("/storage/emulated/0/Download"),
-                        ),
-                        const Divider(),
-                        ListTile(
-                          leading: const Icon(Icons.cleaning_services, color: Colors.orange),
-                          title: const Text("Clear Browser Cache"),
-                          onTap: () async {
-                            await _webController.clearCache();
-                            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Cache Cleared! 🧹")));
-                          },
-                        ),
-                        const Divider(),
-                        const ListTile(
-                          leading: Icon(Icons.verified, color: Colors.green),
-                          title: Text("VidMate Pro Edition"),
-                          subtitle: Text("Permanent Signed Version"),
-                        ),
-                      ],
-                    ),
+                    const Center(child: Text("VidMate Master Pro")),
                   ],
                 ),
-
                 floatingActionButton: _currentTab == 0
                     ? FloatingActionButton(
                         backgroundColor: const Color(0xFFFF2B42),
-                        onPressed: _scanCurrentPageForMedia,
+                        onPressed: () async {
+                          String? u = await _webController.currentUrl();
+                          if (u != null) {
+                            if (u.contains('watch') || u.contains('youtu.be')) {
+                              _fetchYouTubeInfo(u);
+                            } else {
+                              _scanFolderContents(u, "Downloads");
+                            }
+                          }
+                        },
                         child: const Icon(Icons.download, color: Colors.white, size: 28),
                       )
                     : null,
-
                 bottomNavigationBar: BottomNavigationBar(
                   currentIndex: _currentTab,
                   selectedItemColor: Colors.red,
@@ -757,7 +638,7 @@ jobs:
           sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>' android/app/src/main/AndroidManifest.xml
           sed -i 's/<application/<application android:requestLegacyExternalStorage="true"/' android/app/src/main/AndroidManifest.xml
 
-      - name: Build Release APK with Permanent Signature
+      - name: Build Release APK
         run: |
           cd my_downloader
           flutter build apk --release --build-number=${{ github.run_number }} --build-name=1.0.${{ github.run_number }}
