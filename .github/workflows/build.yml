@@ -1,4 +1,4 @@
-name: Build APK
+name: Build Android APK
 
 on:
   push:
@@ -8,133 +8,862 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-      - name: Unzip Project
-        run: unzip FolderGrab.zip
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
 
-      - name: Inject Video Quality Feature
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Create App & Inject Perfect VidMate Code
         run: |
-          python3 - << 'EOF'
-          import os
+          flutter create my_downloader --org com.myvidmate.app
+          cd my_downloader
+          
+          flutter pub add webview_flutter youtube_explode_dart dio path_provider shared_preferences
 
-          # 1. Update MainActivity.kt
-          m_path = "FolderGrab/app/src/main/java/com/example/foldergrab/MainActivity.kt"
-          if os.path.exists(m_path):
-              with open(m_path, "r", encoding="utf-8") as f:
-                  m = f.read()
-              m = m.replace("grabber.confirmAndGrab(extra, w.url ?: extra)", "grabber.checkAndGrab(extra, w.url ?: extra)")
-              m = m.replace("grabber.confirmAndGrab(u, w.url ?: u)", "grabber.checkAndGrab(u, w.url ?: u)")
-              with open(m_path, "w", encoding="utf-8") as f:
-                  f.write(m)
+          cat << 'EOF' > lib/main.dart
+          import 'dart:convert';
+          import 'dart:io';
+          import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+          import 'package:youtube_explode_dart/youtube_explode_dart.dart';
+          import 'package:path_provider/path_provider.dart';
+          import 'package:dio/dio.dart';
+          import 'package:shared_preferences/shared_preferences.dart';
 
-          # 2. Update Grabber.kt
-          g_path = "FolderGrab/app/src/main/java/com/example/foldergrab/Grabber.kt"
-          if os.path.exists(g_path):
-              with open(g_path, "r", encoding="utf-8") as f:
-                  g = f.read()
-
-              video_code = """
-          fun checkAndGrab(link: String, page: String) {
-              if (running) { toast("Thedura vela innum odikittu irukku"); return }
-              if (isMedia(link)) { downloadSingle(link, page); return }
-              if (dlRunning) { toast("Download mudiyura varaikum kaathirunga"); return }
-              val low = link.lowercase()
-              val isLikelyVideo = low.contains("video") || low.contains("watch") || low.contains("view") ||
-                      low.contains("play") || low.contains("clip") || low.contains("movie") || low.contains("song")
-              if (isLikelyVideo) {
-                  inspectVideoPage(link, page)
-              } else {
-                  confirmAndGrab(link, page)
-              }
+          void main() {
+            runApp(const MaterialApp(
+              debugShowCheckedModeBanner: false,
+              home: MainMasterApp(),
+            ));
           }
 
-          private fun inspectVideoPage(link: String, page: String) {
-              toast("Video details edukkuren...")
-              Thread {
-                  try {
-                      val ctx = HttpCtx(view.settings.userAgentString, CookieManager.getInstance().getCookie(link), page)
-                      val html = httpText(link, ctx)
-                      val unescaped = html.replace("\\\\/", "/")
-                      val foundUrls = LinkedHashMap<String, String>()
-                      val lbls = HashMap<String, String>()
+          class DownloadTask {
+            final String id;
+            final String name;
+            final String subfolder;
+            double progress;
+            String status;
+            CancelToken? cancelToken;
 
-                      val re = Regex("(?i)(https?://[^\\\\s\"'<>]+?\\\\.(mp4|webm|m3u8)(\\\\?[^\\\\s\"'<>]*)?)")
-                      for (m in re.findAll(unescaped)) {
-                          val u = m.groupValues[1]
-                          if (!isBlockedHost(u) && !foundUrls.containsKey(u)) {
-                              foundUrls[u] = ""
-                              val start = maxOf(0, m.range.first - 80)
-                              val end = minOf(unescaped.length, m.range.last + 80)
-                              val context = unescaped.substring(start, end)
-                              val q = qualityOf(u, context)
-                              if (q != null) lbls[u] = q.toString() + "p"
+            DownloadTask({
+              required this.id,
+              required this.name,
+              required this.subfolder,
+              this.progress = 0.0,
+              this.status = 'downloading',
+              this.cancelToken,
+            });
+          }
+
+          class MainMasterApp extends StatefulWidget {
+            const MainMasterApp({super.key});
+
+            @override
+            State<MainMasterApp> createState() => _MainMasterAppState();
+          }
+
+          class _MainMasterAppState extends State<MainMasterApp> with SingleTickerProviderStateMixin {
+            int _currentTab = 0;
+            late TabController _downloadTabController;
+            late final WebViewController _webController;
+            final TextEditingController _searchController = TextEditingController();
+            bool _isLoading = false;
+            bool _isBottomSheetOpen = false;
+
+            bool _isDesktopMode = false;
+            static const String desktopUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+            static const String mobileUA = "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36";
+
+            List<DownloadTask> _activeTasks = [];
+            List<Map<String, String>> _bookmarks = [];
+            Map<String, bool> _downloadedQualities = {};
+            List<FileSystemEntity> _downloadedFiles = [];
+
+            Dio _getSafeDio(String refererUrl) {
+              return Dio(BaseOptions(
+                headers: {
+                  'User-Agent': _isDesktopMode ? desktopUA : mobileUA,
+                  'Accept': '*/*',
+                  'Referer': refererUrl,
+                },
+                followRedirects: true,
+                connectTimeout: const Duration(seconds: 30),
+                receiveTimeout: const Duration(seconds: 40),
+              ));
+            }
+
+            @override
+            void initState() {
+              super.initState();
+              _downloadTabController = TabController(length: 2, vsync: this);
+              _loadBookmarks();
+              _loadDownloadedFiles();
+
+              _webController = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..setUserAgent(mobileUA)
+                ..addJavaScriptChannel(
+                  'VidMateBridge',
+                  onMessageReceived: (JavaScriptMessage msg) {
+                    _handleBridgeMessage(msg.message);
+                  },
+                )
+                ..setNavigationDelegate(
+                  NavigationDelegate(
+                    onPageStarted: (url) {
+                      _searchController.text = url;
+                    },
+                    onPageFinished: (url) {
+                      // ★ FolderGrab-ல் வெற்றிகரமாக வேலை செய்த அதே In-Browser Fetch JS தந்திரம் ★
+                      _webController.runJavaScript(r"""
+                        var touchTimer = null;
+                        var isBusy = false;
+
+                        function isVideoLink(link) {
+                          var href = (link.href || '').toLowerCase();
+                          var text = (link.innerText + ' ' + (link.getAttribute('aria-label') || '')).toLowerCase();
+                          if (href.includes('watch') || href.includes('youtu.be') || href.includes('video') || 
+                              href.includes('view') || href.includes('play') || href.includes('.mp4') || 
+                              href.includes('clip') || href.includes('movie')) return true;
+                          if (text.includes('sec') || text.includes('min') || text.includes('360p') || 
+                              text.includes('720p') || text.includes('1080p') || text.includes('hd')) return true;
+                          if (link.querySelector('img') && (text.match(/\d+:\d+/) || text.match(/\d+\s*min/))) return true;
+                          return false;
+                        }
+
+                        function processLink(link, ev) {
+                          if (isBusy || !link || !link.href) return;
+                          isBusy = true;
+                          setTimeout(function() { isBusy = false; }, 1800);
+
+                          var img = link.querySelector('img') || (ev.target.tagName === 'IMG' ? ev.target : null);
+                          var thumb = img ? img.src : '';
+                          var title = link.innerText.trim() || (img ? img.alt : '') || link.title || 'Item';
+                          var href = link.href;
+
+                          // 1. YouTube என்றால்
+                          if (href.includes('watch') || href.includes('youtu.be')) {
+                            VidMateBridge.postMessage(JSON.stringify({type: 'youtube', url: href, name: title}));
+                            return;
                           }
-                      }
 
-                      val relRe = Regex("(?i)[\"'](/[^\"'<>\\\\s\\\\\\\\]+?\\\\.(mp4|webm)(\\\\?[^\"'<>\\\\s\\\\\\\\]*)?)[\"']")
-                      for (m in relRe.findAll(unescaped)) {
-                          val rel = m.groupValues[1]
-                          try {
-                              val full = URL(URL(link), rel).toString()
-                              if (!foundUrls.containsKey(full)) {
-                                  foundUrls[full] = ""
-                                  val q = qualityOf(full, "")
-                                  if (q != null) lbls[full] = q.toString() + "p"
-                              }
-                          } catch (e: Exception) {}
-                      }
-
-                      handler.post {
-                          if (foundUrls.isNotEmpty()) {
-                              found.clear(); refs.clear(); labels.clear(); names.clear(); qkeys.clear()
-                              rootLink = link
-                              for ((u, _) in foundUrls) {
-                                  found[u] = ""
-                                  refs[u] = link
-                                  lbls[u]?.let { labels[u] = it }
-                              }
-                              val hlsList = foundUrls.keys.filter { extOf(pathOf(it)) == "m3u8" }
-                              if (hlsList.isNotEmpty()) {
-                                  presentDetected(foundUrls.keys.toList(), link, "video", lbls)
-                              } else {
-                                  presentSources(found, link)
-                              }
-                          } else {
-                              confirmAndGrab(link, page)
+                          // 2. Video என்றால்
+                          if (isVideoLink(link)) {
+                            fetch(href, {credentials: 'include'})
+                              .then(function(r){ return r.text(); })
+                              .then(function(html){
+                                var unescaped = html.replace(/\\\//g, '/');
+                                var qs = {};
+                                var mp4Regex = /(https?:\/\/[^\s"'<>\\]+?\.(?:mp4|webm|m3u8)(?:\?[^\s"'<>\\]*)?)/gi;
+                                var m = unescaped.match(mp4Regex) || [];
+                                m.forEach(function(u){
+                                  var cl = u.replace(/["']/g, '');
+                                  var q = "360p SD";
+                                  if (cl.includes('1080')) q = "1080p HD";
+                                  else if (cl.includes('720')) q = "720p HD";
+                                  else if (cl.includes('480')) q = "480p";
+                                  else if (Object.keys(qs).length > 0) q = "Video " + (Object.keys(qs).length + 1);
+                                  if (!qs[q]) qs[q] = cl;
+                                });
+                                VidMateBridge.postMessage(JSON.stringify({
+                                  type: 'video_qualities',
+                                  url: href,
+                                  name: title,
+                                  thumb: thumb,
+                                  qualities: qs
+                                }));
+                              })
+                              .catch(function(){
+                                VidMateBridge.postMessage(JSON.stringify({type: 'video_qualities', url: href, name: title, thumb: thumb, qualities: {'Direct MP4': href}}));
+                              });
+                            return;
                           }
-                      }
-                  } catch (e: Exception) {
-                      handler.post { confirmAndGrab(link, page) }
+
+                          // 3. Folder என்றால் (FolderGrab முறையில் 403 பிழை வராமல் Browser-க்குள் fetch)
+                          fetch(href, {credentials: 'include'})
+                            .then(function(r){ return r.text(); })
+                            .then(function(html){
+                              var sMatches = html.match(/[^\s"\'<>\\\/=]+\.mp3/gi) || [];
+                              var songs = [];
+                              sMatches.forEach(function(file){
+                                var full = new URL(file, href).href;
+                                var name = decodeURIComponent(file.split('?')[0]);
+                                if (!songs.some(function(s){ return s.url === full; })) {
+                                  songs.push({title: name, url: full});
+                                }
+                              });
+
+                              var subAlbums = [];
+                              var doc = new DOMParser().parseFromString(html, 'text/html');
+                              doc.querySelectorAll('a').forEach(function(a){
+                                var txt = a.innerText.trim();
+                                if (txt.length > 1 && a.href && !a.href.startsWith('javascript') && !a.href.includes('#')) {
+                                  if (!['Home', 'Songs', 'Bible', 'Quiz', 'Search', 'Contact', 'TV', 'Facebook'].includes(txt)) {
+                                    if (!txt.endsWith('.mp3')) subAlbums.push({name: txt, url: a.href});
+                                  }
+                                }
+                              });
+
+                              VidMateBridge.postMessage(JSON.stringify({
+                                type: 'folder_result',
+                                url: href,
+                                name: title,
+                                songs: songs,
+                                subAlbums: subAlbums
+                              }));
+                            })
+                            .catch(function(){});
+                        }
+
+                        document.addEventListener('contextmenu', function(e) {
+                          var link = e.target.closest('a');
+                          if (link) { e.preventDefault(); processLink(link, e); }
+                        }, true);
+
+                        document.addEventListener('touchstart', function(e) {
+                          var link = e.target.closest('a');
+                          if (link) {
+                            touchTimer = setTimeout(function() { processLink(link, e); }, 650);
+                          }
+                        }, {passive: true});
+
+                        document.addEventListener('touchend', function() { if (touchTimer) clearTimeout(touchTimer); }, {passive: true});
+                        document.addEventListener('touchmove', function() { if (touchTimer) clearTimeout(touchTimer); }, {passive: true});
+                      """);
+                    },
+                  ),
+                )
+                ..loadRequest(Uri.parse('https://m.youtube.com'));
+            }
+
+            void _handleBridgeMessage(String jsonStr) {
+              try {
+                var data = jsonDecode(jsonStr);
+                String type = data['type'];
+                String url = data['url'];
+                String name = data['name'];
+
+                if (type == 'youtube') {
+                  _fetchYouTubeInfo(url);
+                } 
+                else if (type == 'video_qualities') {
+                  Map<String, dynamic> rawQ = data['qualities'] ?? {};
+                  String thumb = data['thumb'] ?? '';
+                  Map<String, String> qMap = rawQ.map((k, v) => MapEntry(k.toString(), v.toString()));
+                  if (qMap.isNotEmpty) {
+                    _showVideoQualityDialog(name, thumb, qMap, url);
+                  } else {
+                    _showVideoQualityDialog(name, thumb, {'Original MP4': url}, url);
                   }
-              }.start()
-          }
-          """
+                } 
+                else if (type == 'folder_result') {
+                  List<dynamic> songs = data['songs'] ?? [];
+                  List<dynamic> subAlbums = data['subAlbums'] ?? [];
+                  _showFolderDialog(name, url, songs, subAlbums);
+                }
+              } catch (_) {}
+            }
 
-              target = "fun confirmAndGrab(link: String, page: String) {"
-              if target in g:
-                  g = g.replace(target, video_code + "\n    " + target)
-                  with open(g_path, "w", encoding="utf-8") as f:
-                      f.write(g)
-                  print("Patch applied successfully!")
-              else:
-                  print("Target function not found!")
+            // 1. Video Quality Selection Popup (VidMate Style)
+            void _showVideoQualityDialog(String title, String thumb, Map<String, String> qualities, String referer) {
+              String selectedFormat = qualities.keys.first;
+
+              showModalBottomSheet(
+                context: context,
+                isScrollControlled: true,
+                shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+                builder: (context) {
+                  return StatefulBuilder(
+                    builder: (context, setModalState) {
+                      return Container(
+                        padding: const EdgeInsets.all(16),
+                        height: MediaQuery.of(context).size.height * 0.65,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                if (thumb.isNotEmpty)
+                                  ClipRRect(
+                                    borderRadius: BorderRadius.circular(8),
+                                    child: Image.network(thumb, width: 80, height: 60, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const Icon(Icons.video_library, size: 40)),
+                                  )
+                                else
+                                  const Icon(Icons.video_library, size: 50, color: Colors.red),
+                                const SizedBox(width: 12),
+                                Expanded(child: Text(title, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13))),
+                              ],
+                            ),
+                            const Divider(height: 20),
+                            const Text("🎬 Video Qualities", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.red)),
+                            const SizedBox(height: 8),
+                            Expanded(
+                              child: ListView(
+                                children: [
+                                  for (var q in qualities.keys)
+                                    RadioListTile(
+                                      title: Row(
+                                        children: [
+                                          Text(q),
+                                          const Spacer(),
+                                          if (_downloadedQualities[q] == true)
+                                            const Text("✓✓", style: TextStyle(color: Colors.blue, fontWeight: FontWeight.bold)),
+                                        ],
+                                      ),
+                                      value: q,
+                                      groupValue: selectedFormat,
+                                      onChanged: (val) {
+                                        setModalState(() {
+                                          selectedFormat = val.toString();
+                                        });
+                                      },
+                                    ),
+                                ],
+                              ),
+                            ),
+                            SizedBox(
+                              width: double.infinity,
+                              height: 48,
+                              child: ElevatedButton(
+                                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFFF2B42), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(25))),
+                                child: const Text("DOWNLOAD", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
+                                onPressed: () {
+                                  Navigator.pop(context);
+                                  String streamUrl = qualities[selectedFormat]!;
+                                  String cleanTitle = title.replaceAll(RegExp(r'[^\w\s]+'), '').trim();
+                                  if (cleanTitle.isEmpty) cleanTitle = "Video";
+                                  _startFileDownload(streamUrl, "Videos", referer, fileName: "$cleanTitle-$selectedFormat.mp4");
+                                  setState(() {
+                                    _downloadedQualities[selectedFormat] = true;
+                                    _currentTab = 2;
+                                  });
+                                },
+                              ),
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  );
+                },
+              );
+            }
+
+            // 2. Folder Dialog (403 பிழை இல்லாமல் நேரடியாகப் பாடல்களை எடுக்கும் முறை)
+            void _showFolderDialog(String folderName, String folderUrl, List<dynamic> songs, List<dynamic> subAlbums) {
+              String cleanName = folderName.replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
+              if (cleanName.isEmpty) cleanName = "Album";
+
+              if (songs.isNotEmpty) {
+                showDialog(
+                  context: context,
+                  builder: (ctx) => AlertDialog(
+                    title: Row(
+                      children: [
+                        const Icon(Icons.folder, color: Colors.amber, size: 28),
+                        const SizedBox(width: 8),
+                        Expanded(child: Text(cleanName, style: const TextStyle(fontWeight: FontWeight.bold))),
+                      ],
+                    ),
+                    content: Text("இந்த ஆல்பத்தில் ${songs.length} பாடல்கள் கண்டறியப்பட்டுள்ளன!\n\nஅனைத்தையும் 'Download/$cleanName/' ஃபோல்டரில் டவுன்லோட் செய்யவா?"),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
+                      ElevatedButton(
+                        style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                        onPressed: () {
+                          Navigator.pop(ctx);
+                          for (var s in songs) {
+                            String sUrl = s['url'].toString();
+                            String sTitle = s['title'].toString();
+                            _startFileDownload(sUrl, cleanName, folderUrl, fileName: sTitle);
+                          }
+                          setState(() => _currentTab = 2);
+                        },
+                        child: Text("Download All (${songs.length})", style: const TextStyle(color: Colors.white)),
+                      )
+                    ],
+                  ),
+                );
+              } else if (subAlbums.isNotEmpty) {
+                showDialog(
+                  context: context,
+                  builder: (ctx) => AlertDialog(
+                    title: Text("📁 $cleanName"),
+                    content: Text("இதில் ${subAlbums.length} Albums உள்ளன (Aalayamani, Amaithikaaga...). அனைத்தையும் Subfolder அமைப்பில் பார்க்க திறந்து செல்லவா?"),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
+                      ElevatedButton(
+                        style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                        onPressed: () {
+                          Navigator.pop(ctx);
+                          _webController.loadRequest(Uri.parse(folderUrl));
+                        },
+                        child: const Text("Open Album", style: TextStyle(color: Colors.white)),
+                      )
+                    ],
+                  ),
+                );
+              }
+            }
+
+            Future<void> _startFileDownload(String fileUrl, String subfolder, String referer, {String? fileName}) async {
+              String name = fileName ?? Uri.decodeComponent(fileUrl.split('/').last.split('?').first);
+              if (!name.contains('.')) name = "$name.mp3";
+              name = name.replaceAll(RegExp(r'[^\w\s\.\-]+'), '').trim();
+
+              CancelToken cancelToken = CancelToken();
+              var task = DownloadTask(
+                id: DateTime.now().millisecondsSinceEpoch.toString() + fileUrl.hashCode.toString(),
+                name: name,
+                subfolder: subfolder,
+                cancelToken: cancelToken,
+              );
+
+              setState(() {
+                _activeTasks.add(task);
+              });
+
+              try {
+                Directory baseDir = Directory('/storage/emulated/0/Download');
+                if (!await baseDir.exists()) baseDir = (await getExternalStorageDirectory())!;
+                
+                Directory targetDir = Directory('${baseDir.path}/$subfolder');
+                if (!await targetDir.exists()) await targetDir.create(recursive: true);
+
+                String savePath = "${targetDir.path}/$name";
+
+                var dio = _getSafeDio(referer);
+                await dio.download(
+                  fileUrl,
+                  savePath,
+                  cancelToken: cancelToken,
+                  onReceiveProgress: (received, total) {
+                    if (total > 0) {
+                      setState(() {
+                        task.progress = received / total;
+                      });
+                    }
+                  },
+                );
+
+                setState(() {
+                  task.status = 'completed';
+                  _activeTasks.remove(task);
+                });
+                _loadDownloadedFiles();
+              } catch (_) {
+                setState(() {
+                  task.status = 'failed';
+                  _activeTasks.remove(task);
+                });
+              }
+            }
+
+            // YouTube Downloader
+            void _fetchYouTubeInfo(String url) async {
+              if (_isBottomSheetOpen || _isLoading) return;
+              _isBottomSheetOpen = true;
+              _isLoading = true;
+              setState(() {});
+
+              var yt = YoutubeExplode();
+              try {
+                var video = await yt.videos.get(url);
+                var manifest = await yt.videos.streamsClient.getManifest(video.id);
+                _isLoading = false;
+                setState(() {});
+                await _showYouTubeQualityDialog(video, manifest);
+              } catch (_) {
+                _isLoading = false;
+                setState(() {});
+              } finally {
+                yt.close();
+                _isBottomSheetOpen = false;
+              }
+            }
+
+            Future<void> _showYouTubeQualityDialog(Video video, StreamManifest manifest) async {
+              String selectedFormat = '720p';
+              dynamic selectedStream;
+              var muxedStreams = manifest.muxed;
+              var audioStreams = manifest.audioOnly;
+
+              await showModalBottomSheet(
+                context: context,
+                isScrollControlled: true,
+                shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+                builder: (context) {
+                  return StatefulBuilder(
+                    builder: (context, setModalState) {
+                      return Container(
+                        padding: const EdgeInsets.all(16),
+                        height: MediaQuery.of(context).size.height * 0.75,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                ClipRRect(
+                                  borderRadius: BorderRadius.circular(8),
+                                  child: Image.network(video.thumbnails.mediumResUrl, width: 80, height: 60, fit: BoxFit.cover),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(child: Text(video.title, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13))),
+                              ],
+                            ),
+                            const Divider(height: 20),
+                            const Text("🎵 Audio", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.red)),
+                            RadioListTile(
+                              title: Row(
+                                children: [
+                                  const Text("MP3 Audio"),
+                                  const Spacer(),
+                                  if (_downloadedQualities['audio'] == true)
+                                    const Text("✓✓", style: TextStyle(color: Colors.blue, fontWeight: FontWeight.bold)),
+                                ],
+                              ),
+                              value: 'audio',
+                              groupValue: selectedFormat,
+                              onChanged: (val) {
+                                setModalState(() {
+                                  selectedFormat = val.toString();
+                                  selectedStream = audioStreams.withHighestBitrate();
+                                });
+                              },
+                            ),
+                            const Text("🎬 Video Qualities", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.red)),
+                            Expanded(
+                              child: ListView(
+                                children: [
+                                  for (var q in ['1080p', '720p', '480p', '360p', '240p'])
+                                    RadioListTile(
+                                      title: Row(
+                                        children: [
+                                          Text("$q HD"),
+                                          const Spacer(),
+                                          if (_downloadedQualities[q] == true)
+                                            const Text("✓✓", style: TextStyle(color: Colors.blue, fontWeight: FontWeight.bold)),
+                                        ],
+                                      ),
+                                      value: q,
+                                      groupValue: selectedFormat,
+                                      onChanged: (val) {
+                                        setModalState(() {
+                                          selectedFormat = val.toString();
+                                          selectedStream = muxedStreams.firstWhere((s) => s.qualityLabel.contains(q), orElse: () => muxedStreams.first);
+                                        });
+                                      },
+                                    ),
+                                ],
+                              ),
+                            ),
+                            SizedBox(
+                              width: double.infinity,
+                              height: 48,
+                              child: ElevatedButton(
+                                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFFF2B42), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(25))),
+                                child: const Text("DOWNLOAD", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
+                                onPressed: () {
+                                  Navigator.pop(context);
+                                  _downloadYouTubeStream(video, selectedStream ?? muxedStreams.first, selectedFormat);
+                                },
+                              ),
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  );
+                },
+              );
+            }
+
+            Future<void> _downloadYouTubeStream(Video video, dynamic streamInfo, String quality) async {
+              String cleanTitle = video.title.replaceAll(RegExp(r'[^\w\s]+'), '');
+              String fileName = "$cleanTitle-$quality.mp4";
+
+              var task = DownloadTask(
+                id: DateTime.now().millisecondsSinceEpoch.toString(),
+                name: fileName,
+                subfolder: "YouTube",
+              );
+
+              setState(() {
+                _activeTasks.add(task);
+                _currentTab = 2;
+              });
+
+              var yt = YoutubeExplode();
+              var stream = yt.videos.streamsClient.get(streamInfo);
+
+              Directory dir = Directory('/storage/emulated/0/Download');
+              if (!await dir.exists()) dir = (await getExternalStorageDirectory())!;
+              var file = File('${dir.path}/$fileName');
+
+              var fileStream = file.openWrite();
+              await stream.pipe(fileStream);
+              await fileStream.flush();
+              await fileStream.close();
+              yt.close();
+
+              setState(() {
+                _downloadedQualities[quality] = true;
+                _activeTasks.remove(task);
+              });
+              _loadDownloadedFiles();
+              ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("✅ Saved $quality (✓✓)!")));
+            }
+
+            Future<void> _loadBookmarks() async {
+              final prefs = await SharedPreferences.getInstance();
+              final String? data = prefs.getString('saved_bookmarks');
+              if (data != null) {
+                setState(() {
+                  _bookmarks = List<Map<String, String>>.from((jsonDecode(data) as List).map((i) => Map<String, String>.from(i)));
+                });
+              }
+            }
+
+            Future<void> _toggleBookmark() async {
+              String? currentUrl = await _webController.currentUrl();
+              String? title = await _webController.getTitle();
+              if (currentUrl == null) return;
+
+              final prefs = await SharedPreferences.getInstance();
+              bool exists = _bookmarks.any((b) => b['url'] == currentUrl);
+
+              setState(() {
+                if (exists) {
+                  _bookmarks.removeWhere((b) => b['url'] == currentUrl);
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Bookmark Removed! ❌")));
+                } else {
+                  _bookmarks.add({'title': title ?? 'Page', 'url': currentUrl});
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Bookmarked! ⭐")));
+                }
+              });
+              await prefs.setString('saved_bookmarks', jsonEncode(_bookmarks));
+            }
+
+            Future<void> _loadDownloadedFiles() async {
+              try {
+                Directory dir = Directory('/storage/emulated/0/Download');
+                if (!await dir.exists()) dir = (await getExternalStorageDirectory())!;
+                if (await dir.exists()) {
+                  setState(() {
+                    _downloadedFiles = dir.listSync(recursive: true).where((f) {
+                      String ext = f.path.split('.').last.toLowerCase();
+                      return ['mp4', 'mp3', 'm4a', 'wav', 'aac'].contains(ext);
+                    }).toList();
+                  });
+                }
+              } catch (_) {}
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(
+                  backgroundColor: Colors.white,
+                  elevation: 1,
+                  title: Container(
+                    height: 38,
+                    decoration: BoxDecoration(color: Colors.grey[200], borderRadius: BorderRadius.circular(20)),
+                    child: TextField(
+                      controller: _searchController,
+                      style: const TextStyle(fontSize: 14),
+                      decoration: const InputDecoration(
+                        hintText: "Search or enter URL...",
+                        prefixIcon: Icon(Icons.search, size: 18, color: Colors.grey),
+                        border: InputBorder.none,
+                        contentPadding: EdgeInsets.only(top: 8),
+                      ),
+                      onSubmitted: (url) {
+                        String target = url.trim();
+                        if (!target.startsWith('http')) target = 'https://m.youtube.com/results?search_query=${Uri.encodeComponent(target)}';
+                        _webController.loadRequest(Uri.parse(target));
+                      },
+                    ),
+                  ),
+                  actions: [
+                    IconButton(
+                      icon: Icon(Icons.desktop_windows, size: 21, color: _isDesktopMode ? Colors.blue : Colors.black87),
+                      tooltip: "Desktop Mode",
+                      onPressed: () async {
+                        setState(() => _isDesktopMode = !_isDesktopMode);
+                        await _webController.setUserAgent(_isDesktopMode ? desktopUA : mobileUA);
+                        await _webController.reload();
+                      },
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.add_box_outlined, size: 21, color: Colors.black87),
+                      tooltip: "New Tab",
+                      onPressed: () {
+                        _searchController.clear();
+                        _webController.loadRequest(Uri.parse('https://www.google.com'));
+                        setState(() => _currentTab = 0);
+                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("New Page Opened! 🌐")));
+                      },
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.star_border, size: 22, color: Colors.amber),
+                      tooltip: "Bookmark",
+                      onPressed: _toggleBookmark,
+                    ),
+                    const SizedBox(width: 4),
+                  ],
+                ),
+                body: IndexedStack(
+                  index: _currentTab,
+                  children: [
+                    Stack(
+                      children: [
+                        WebViewWidget(controller: _webController),
+                        if (_isLoading) const Center(child: CircularProgressIndicator(color: Colors.red)),
+                      ],
+                    ),
+                    _bookmarks.isEmpty
+                        ? const Center(child: Text("Bookmark எதுவும் இல்லை! ⭐"))
+                        : ListView.builder(
+                            itemCount: _bookmarks.length,
+                            itemBuilder: (ctx, i) => ListTile(
+                              leading: const Icon(Icons.bookmark, color: Colors.amber),
+                              title: Text(_bookmarks[i]['title'] ?? '', maxLines: 1),
+                              onTap: () {
+                                _webController.loadRequest(Uri.parse(_bookmarks[i]['url']!));
+                                setState(() => _currentTab = 0);
+                              },
+                            ),
+                          ),
+                    Column(
+                      children: [
+                        Container(
+                          color: Colors.white,
+                          child: TabBar(
+                            controller: _downloadTabController,
+                            labelColor: Colors.red,
+                            unselectedLabelColor: Colors.grey,
+                            indicatorColor: Colors.red,
+                            tabs: [
+                              Tab(text: "Downloading (${_activeTasks.length})"),
+                              Tab(text: "Downloaded (${_downloadedFiles.length})"),
+                            ],
+                          ),
+                        ),
+                        Expanded(
+                          child: TabBarView(
+                            controller: _downloadTabController,
+                            children: [
+                              _activeTasks.isEmpty
+                                  ? const Center(child: Text("டவுன்லோட் எதுவும் இல்லை!"))
+                                  : ListView.builder(
+                                      itemCount: _activeTasks.length,
+                                      itemBuilder: (ctx, i) {
+                                        var t = _activeTasks[i];
+                                        return Card(
+                                          margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                          child: Padding(
+                                            padding: const EdgeInsets.all(12),
+                                            child: Column(
+                                              crossAxisAlignment: CrossAxisAlignment.start,
+                                              children: [
+                                                Text(t.name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.bold)),
+                                                const SizedBox(height: 4),
+                                                Text("📁 Folder: ${t.subfolder}", style: const TextStyle(fontSize: 12, color: Colors.blue)),
+                                                const SizedBox(height: 8),
+                                                LinearProgressIndicator(value: t.progress > 0 ? t.progress : null, color: Colors.red),
+                                                const SizedBox(height: 6),
+                                                Text("${(t.progress * 100).toStringAsFixed(1)}%"),
+                                              ],
+                                            ),
+                                          ),
+                                        );
+                                      },
+                                    ),
+                              _downloadedFiles.isEmpty
+                                  ? const Center(child: Text("கோப்புகள் இல்லை!"))
+                                  : ListView.builder(
+                                      itemCount: _downloadedFiles.length,
+                                      itemBuilder: (ctx, i) {
+                                        var f = _downloadedFiles[i];
+                                        return ListTile(
+                                          leading: const Icon(Icons.music_video, color: Colors.red),
+                                          title: Text(f.path.split('/').last, maxLines: 1),
+                                          subtitle: Text(f.path.replaceFirst('/storage/emulated/0/Download/', '')),
+                                          trailing: IconButton(
+                                            icon: const Icon(Icons.delete, color: Colors.grey),
+                                            onPressed: () {
+                                              f.deleteSync();
+                                              _loadDownloadedFiles();
+                                            },
+                                          ),
+                                        );
+                                      },
+                                    ),
+                            ],
+                          ),
+                        )
+                      ],
+                    ),
+                    const Center(child: Text("VidMate Master Pro")),
+                  ],
+                ),
+                floatingActionButton: _currentTab == 0
+                    ? FloatingActionButton(
+                        backgroundColor: const Color(0xFFFF2B42),
+                        onPressed: () async {
+                          String? u = await _webController.currentUrl();
+                          if (u != null) {
+                            if (u.contains('watch') || u.contains('youtu.be')) {
+                              _fetchYouTubeInfo(u);
+                            }
+                          }
+                        },
+                        child: const Icon(Icons.download, color: Colors.white, size: 28),
+                      )
+                    : null,
+                bottomNavigationBar: BottomNavigationBar(
+                  currentIndex: _currentTab,
+                  selectedItemColor: Colors.red,
+                  unselectedItemColor: Colors.grey,
+                  type: BottomNavigationBarType.fixed,
+                  onTap: (index) {
+                    if (index == 2) _loadDownloadedFiles();
+                    setState(() => _currentTab = index);
+                  },
+                  items: const [
+                    BottomNavigationBarItem(icon: Icon(Icons.home), label: "Home"),
+                    BottomNavigationBarItem(icon: Icon(Icons.bookmark), label: "Bookmarks"),
+                    BottomNavigationBarItem(icon: Icon(Icons.download), label: "Downloads"),
+                    BottomNavigationBarItem(icon: Icon(Icons.settings), label: "Settings"),
+                  ],
+                ),
+              );
+            }
+          }
           EOF
 
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
+          # Cleartext HTTP மற்றும் Permissions
+          sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>' android/app/src/main/AndroidManifest.xml
+          sed -i 's/<application/<application android:usesCleartextTraffic="true" android:requestLegacyExternalStorage="true"/' android/app/src/main/AndroidManifest.xml
 
-      - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: 8.7
+      - name: Build Release APK
+        run: |
+          cd my_downloader
+          flutter build apk --release --build-number=${{ github.run_number }} --build-name=1.0.${{ github.run_number }}
 
-      - run: gradle assembleDebug
-        working-directory: FolderGrab
-
-      - uses: actions/upload-artifact@v4
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: FolderGrab-debug-apk
-          path: FolderGrab/app/build/outputs/apk/debug/app-debug.apk
+          name: VidMate-Final-APK
+          path: my_downloader/build/app/outputs/flutter-apk/app-release.apk
