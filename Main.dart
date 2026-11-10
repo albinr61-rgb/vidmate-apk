@@ -1,0 +1,195 @@
+import 'dart:io';
+import 'package:flutter/material.dart';
+import 'package:youtube_explode_dart/youtube_explode_dart.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
+
+void main() {
+  runApp(const MaterialApp(
+    debugShowCheckedModeBanner: false,
+    home: VidMateClone(),
+  ));
+}
+
+class VidMateClone extends StatefulWidget {
+  const VidMateClone({super.key});
+
+  @override
+  State<VidMateClone> createState() => _VidMateCloneState();
+}
+
+class _VidMateCloneState extends State<VidMateClone> {
+  int _currentIndex = 0;
+  final TextEditingController _urlController = TextEditingController();
+  bool _isLoading = false;
+
+  void _showDownloadDialog(Video video, StreamManifest manifest) {
+    String selectedFormat = '720p';
+    dynamic selectedStream;
+    var audioStreams = manifest.audioOnly;
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            return Container(
+              padding: const EdgeInsets.all(16),
+              height: MediaQuery.of(context).size.height * 0.70,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(8),
+                        child: Image.network(video.thumbnails.mediumResUrl, width: 80, height: 60, fit: BoxFit.cover),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Text(video.title, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                      ),
+                    ],
+                  ),
+                  const Divider(height: 20),
+                  const Text("🎵 Music", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.red)),
+                  RadioListTile(
+                    title: const Text("128K (MP3 / Audio)"),
+                    value: 'audio',
+                    groupValue: selectedFormat,
+                    onChanged: (val) {
+                      setModalState(() {
+                        selectedFormat = val.toString();
+                        selectedStream = audioStreams.withHighestBitrate();
+                      });
+                    },
+                  ),
+                  const Text("🎬 Video", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.red)),
+                  Expanded(
+                    child: ListView(
+                      children: [
+                        RadioListTile(
+                          title: const Text("360p (MP4)"),
+                          value: '360p',
+                          groupValue: selectedFormat,
+                          onChanged: (val) {
+                            setModalState(() {
+                              selectedFormat = val.toString();
+                              selectedStream = manifest.muxed.firstWhere((s) => s.qualityLabel == '360p', orElse: () => manifest.muxed.first);
+                            });
+                          },
+                        ),
+                        RadioListTile(
+                          title: const Text("720p HD (MP4)"),
+                          value: '720p',
+                          groupValue: selectedFormat,
+                          onChanged: (val) {
+                            setModalState(() {
+                              selectedFormat = val.toString();
+                              selectedStream = manifest.muxed.firstWhere((s) => s.qualityLabel == '720p', orElse: () => manifest.muxed.first);
+                            });
+                          },
+                        ),
+                      ],
+                    ),
+                  ),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 48,
+                    child: ElevatedButton(
+                      style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFFF2B42), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(25))),
+                      child: const Text("DOWNLOAD", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
+                      onPressed: () {
+                        Navigator.pop(context);
+                        _startDownload(video, selectedStream ?? manifest.muxed.first);
+                      },
+                    ),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _fetchVideo() async {
+    String url = _urlController.text.trim();
+    if (url.isEmpty) return;
+    setState(() => _isLoading = true);
+    var yt = YoutubeExplode();
+    try {
+      var video = await yt.videos.get(url);
+      var manifest = await yt.videos.streamsClient.getManifest(video.id);
+      setState(() => _isLoading = false);
+      _showDownloadDialog(video, manifest);
+    } catch (e) {
+      setState(() => _isLoading = false);
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Error: $e")));
+    } finally {
+      yt.close();
+    }
+  }
+
+  Future<void> _startDownload(Video video, dynamic streamInfo) async {
+    await Permission.storage.request();
+    var yt = YoutubeExplode();
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Downloading started...")));
+
+    var stream = yt.videos.streamsClient.get(streamInfo);
+    var dir = await getExternalStorageDirectory();
+    var cleanTitle = video.title.replaceAll(RegExp(r'[^\w\s]+'), '');
+    var file = File('${dir!.path}/$cleanTitle.mp4');
+
+    var fileStream = file.openWrite();
+    await stream.pipe(fileStream);
+    await fileStream.flush();
+    await fileStream.close();
+    yt.close();
+
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Saved to: ${file.path} ✅")));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: Colors.white,
+        elevation: 1,
+        title: Container(
+          height: 42,
+          decoration: BoxDecoration(color: Colors.grey[200], borderRadius: BorderRadius.circular(20)),
+          child: TextField(
+            controller: _urlController,
+            decoration: InputDecoration(
+              hintText: "Paste YouTube Link...",
+              prefixIcon: const Icon(Icons.search, color: Colors.grey),
+              suffixIcon: IconButton(icon: const Icon(Icons.arrow_forward, color: Colors.red), onPressed: _fetchVideo),
+              border: InputBorder.none,
+              contentPadding: const EdgeInsets.only(top: 8),
+            ),
+          ),
+        ),
+      ),
+      body: _isLoading
+          ? const Center(child: CircularProgressIndicator(color: Colors.red))
+          : const Center(child: Text("YouTube Link-ஐ மேலே Paste செய்து Search பண்ணுங்க!", style: TextStyle(color: Colors.grey))),
+      bottomNavigationBar: BottomNavigationBar(
+        currentIndex: _currentIndex,
+        selectedItemColor: Colors.red,
+        unselectedItemColor: Colors.grey,
+        type: BottomNavigationBarType.fixed,
+        onTap: (index) => setState(() => _currentIndex = index),
+        items: const [
+          BottomNavigationBarItem(icon: Icon(Icons.home), label: "HOME"),
+          BottomNavigationBarItem(icon: Icon(Icons.music_note), label: "MUSIC"),
+          BottomNavigationBarItem(icon: Icon(Icons.download), label: "MY FILES"),
+          BottomNavigationBarItem(icon: Icon(Icons.person), label: "ME"),
+        ],
+      ),
+    );
+  }
+}
