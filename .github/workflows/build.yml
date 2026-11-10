@@ -85,10 +85,29 @@ jobs:
             final TextEditingController _searchController = TextEditingController();
             bool _isLoading = false;
 
+            // Desktop Mode State & User Agents
+            bool _isDesktopMode = false;
+            static const String desktopUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+            static const String mobileUA = "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36";
+
             List<DownloadTask> _activeTasks = [];
             List<Map<String, String>> _bookmarks = [];
             Map<String, bool> _downloadedQualities = {};
             List<FileSystemEntity> _downloadedFiles = [];
+
+            // 403 Forbidden பிழையைத் தடுக்கும் Real Browser Client
+            Dio _getSafeDio(String refererUrl) {
+              return Dio(BaseOptions(
+                headers: {
+                  'User-Agent': _isDesktopMode ? desktopUA : mobileUA,
+                  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                  'Accept-Language': 'en-US,en;q=0.9',
+                  'Referer': refererUrl,
+                },
+                followRedirects: true,
+                validateStatus: (status) => status != null && status < 500,
+              ));
+            }
 
             @override
             void initState() {
@@ -99,6 +118,7 @@ jobs:
 
               _webController = WebViewController()
                 ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..setUserAgent(mobileUA)
                 ..addJavaScriptChannel(
                   'FolderDownloader',
                   onMessageReceived: (JavaScriptMessage message) {
@@ -126,6 +146,18 @@ jobs:
                   ),
                 )
                 ..loadRequest(Uri.parse('https://m.youtube.com'));
+            }
+
+            // Desktop Mode Toggle
+            Future<void> _toggleDesktopMode() async {
+              setState(() {
+                _isDesktopMode = !_isDesktopMode;
+              });
+              await _webController.setUserAgent(_isDesktopMode ? desktopUA : mobileUA);
+              await _webController.reload();
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text(_isDesktopMode ? "Desktop Mode ON 💻" : "Mobile Mode ON 📱")),
+              );
             }
 
             Future<void> _loadBookmarks() async {
@@ -175,7 +207,7 @@ jobs:
               } catch (_) {}
             }
 
-            // சரிசெய்யப்பட்ட Smart Media Crawler (Syntax Error நீக்கப்பட்டது)
+            // Folder Long Press (403 பிழை வராமல் Browser Headers உடன் இயங்குகிறது)
             Future<void> _handleFolderLongPress(String jsonStr) async {
               try {
                 var data = jsonDecode(jsonStr);
@@ -184,7 +216,9 @@ jobs:
 
                 ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("'$folderName' ஆராயப்படுகிறது...")));
 
-                var response = await Dio().get(folderUrl);
+                // Browser Headers உடன் Server-க்கு Request அனுப்புகிறோம்
+                var dio = _getSafeDio(folderUrl);
+                var response = await dio.get(folderUrl);
                 String html = response.data.toString();
 
                 final regex = RegExp(
@@ -207,7 +241,7 @@ jobs:
                     context: context,
                     builder: (ctx) => AlertDialog(
                       title: Text("📁 $folderName Album"),
-                      content: Text("இந்த Folder-ல் ${mediaUrls.length} பாடல்கள் உள்ளன! அனைத்தையும் Subfolder-ல் டவுன்லோட் செய்யவா?"),
+                      content: Text("இந்த Album-ல் ${mediaUrls.length} பாடல்கள் கண்டறியப்பட்டுள்ளன! அனைத்தையும் Subfolder-ல் டவுன்லோட் செய்யவா?"),
                       actions: [
                         TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
                         ElevatedButton(
@@ -215,7 +249,7 @@ jobs:
                           onPressed: () {
                             Navigator.pop(ctx);
                             for (var songUrl in mediaUrls) {
-                              _startFileDownload(songUrl, folderName);
+                              _startFileDownload(songUrl, folderName, folderUrl);
                             }
                             setState(() => _currentTab = 2);
                           },
@@ -226,9 +260,9 @@ jobs:
                   );
                 } else {
                   if (folderUrl.endsWith('.mp3') || folderUrl.endsWith('.mp4')) {
-                    _startFileDownload(folderUrl, folderName);
+                    _startFileDownload(folderUrl, folderName, folderUrl);
                   } else {
-                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("இந்தப் பக்கத்தில் நேரடியாக பாடல்கள் இல்லை. Folder-ஐ கிளிக் செய்து உள்ளே செல்லுங்கள்!")));
+                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("நேரடிப் பாடல்கள் இல்லை. Folder-ஐ தொட்டு உள்ளே சென்று சிவப்பு Download பட்டனை அழுத்தவும்!")));
                   }
                 }
               } catch (e) {
@@ -236,7 +270,7 @@ jobs:
               }
             }
 
-            Future<void> _startFileDownload(String fileUrl, String subfolder) async {
+            Future<void> _startFileDownload(String fileUrl, String subfolder, String referer) async {
               String fileName = Uri.decodeComponent(fileUrl.split('/').last.split('?').first);
               if (fileName.isEmpty || !fileName.contains('.')) fileName = "song_${DateTime.now().millisecondsSinceEpoch}.mp3";
 
@@ -261,7 +295,8 @@ jobs:
 
                 String savePath = "${targetDir.path}/$fileName";
 
-                await Dio().download(
+                var dio = _getSafeDio(referer);
+                await dio.download(
                   fileUrl,
                   savePath,
                   cancelToken: cancelToken,
@@ -480,7 +515,7 @@ jobs:
                               onPressed: () {
                                 Navigator.pop(ctx);
                                 for (var u in urls) {
-                                  _startFileDownload(u.toString(), "Website_Downloads");
+                                  _startFileDownload(u.toString(), "Website_Downloads", currentUrl);
                                 }
                                 setState(() => _currentTab = 2);
                               },
@@ -527,6 +562,15 @@ jobs:
                     ),
                   ),
                   actions: [
+                    // Desktop Mode Button (💻)
+                    IconButton(
+                      icon: Icon(
+                        Icons.desktop_windows,
+                        color: _isDesktopMode ? Colors.blue : Colors.black87,
+                      ),
+                      tooltip: _isDesktopMode ? "Desktop Mode: ON" : "Desktop Mode: OFF",
+                      onPressed: _toggleDesktopMode,
+                    ),
                     IconButton(
                       icon: const Icon(Icons.add_box_outlined, color: Colors.black87),
                       onPressed: () {
