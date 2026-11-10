@@ -27,7 +27,6 @@ jobs:
       - name: Configure Permanent Signing Keystore (For Direct App Updates)
         run: |
           mkdir -p ~/.android
-          # நிலையான Keystore பதிவிறக்கப்படுகிறது - இதனால் Delete செய்யாமல் Update ஆகும்
           curl -L -o ~/.android/debug.keystore https://raw.githubusercontent.com/CoreProc/android-debug-keystore/master/debug.keystore
 
       - name: Create App & Inject Smart Downloader Code
@@ -54,13 +53,12 @@ jobs:
             ));
           }
 
-          // டவுன்லோட் பணிகளைக் கண்காணிக்க மாடல்
           class DownloadTask {
             final String id;
             final String name;
             final String subfolder;
             double progress;
-            String status; // 'downloading', 'completed', 'failed'
+            String status;
             CancelToken? cancelToken;
 
             DownloadTask({
@@ -114,8 +112,7 @@ jobs:
                       _autoDetectYouTube(url);
                     },
                     onPageFinished: (url) {
-                      // பக்கத்தில் உள்ள Folder/Link-களை Long press செய்தால் கண்டறியும் JS
-                      _webController.runJavaScript('''
+                      _webController.runJavaScript(r"""
                         document.addEventListener('contextmenu', function(e) {
                           var target = e.target.closest('a');
                           if (target && target.href) {
@@ -124,7 +121,7 @@ jobs:
                             FolderDownloader.postMessage(JSON.stringify({url: target.href, name: fName}));
                           }
                         });
-                      ''');
+                      """);
                     },
                   ),
                 )
@@ -178,20 +175,22 @@ jobs:
               } catch (_) {}
             }
 
-            // 1. Smart Folder Crawler (index.php வராமல் உண்மையான MP3-களை எடுக்கும் முறை)
+            // சரிசெய்யப்பட்ட Smart Media Crawler (Syntax Error நீக்கப்பட்டது)
             Future<void> _handleFolderLongPress(String jsonStr) async {
               try {
                 var data = jsonDecode(jsonStr);
                 String folderUrl = data['url'];
                 String folderName = data['name'].replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
 
-                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("'$folderName' Folder ஆராயப்படுகிறது...")));
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("'$folderName' ஆராயப்படுகிறது...")));
 
-                // அந்த Webpage-ஐ பின்னணியில் படித்து அதில் உள்ள MP3 இணைப்புகளைத் தேடுகிறோம்
                 var response = await Dio().get(folderUrl);
                 String html = response.data.toString();
 
-                RegExp regex = RegExp(r'href=[\'"]([^\'"]+\.(?:mp3|m4a|mp4|wav|aac))[\'"]', caseSensitive: false);
+                final regex = RegExp(
+                  r"""(?:href|src)\s*=\s*["']([^"']+\.(?:mp3|m4a|mp4|wav|aac)[^"']*)["']""",
+                  caseSensitive: false,
+                );
                 var matches = regex.allMatches(html);
                 List<String> mediaUrls = [];
 
@@ -208,7 +207,7 @@ jobs:
                     context: context,
                     builder: (ctx) => AlertDialog(
                       title: Text("📁 $folderName Album"),
-                      content: Text("இந்த Folder-ல் ${mediaUrls.length} பாடல்கள் கண்டறியப்பட்டுள்ளன! அனைத்தையும் Subfolder உருவாக்கி டவுன்லோட் செய்யவா?"),
+                      content: Text("இந்த Folder-ல் ${mediaUrls.length} பாடல்கள் உள்ளன! அனைத்தையும் Subfolder-ல் டவுன்லோட் செய்யவா?"),
                       actions: [
                         TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
                         ElevatedButton(
@@ -218,7 +217,7 @@ jobs:
                             for (var songUrl in mediaUrls) {
                               _startFileDownload(songUrl, folderName);
                             }
-                            setState(() => _currentTab = 2); // Downloads பக்கத்திற்கு அழைத்துச் செல்லும்
+                            setState(() => _currentTab = 2);
                           },
                           child: Text("Download All (${mediaUrls.length})", style: const TextStyle(color: Colors.white)),
                         )
@@ -226,7 +225,6 @@ jobs:
                     ),
                   );
                 } else {
-                  // நேரடியாக MP3 லிங்க்காக இருந்தால்
                   if (folderUrl.endsWith('.mp3') || folderUrl.endsWith('.mp4')) {
                     _startFileDownload(folderUrl, folderName);
                   } else {
@@ -238,7 +236,6 @@ jobs:
               }
             }
 
-            // ஃபைல் டவுன்லோட் செய்து Downloading Tab-ல் காட்டுவது
             Future<void> _startFileDownload(String fileUrl, String subfolder) async {
               String fileName = Uri.decodeComponent(fileUrl.split('/').last.split('?').first);
               if (fileName.isEmpty || !fileName.contains('.')) fileName = "song_${DateTime.now().millisecondsSinceEpoch}.mp3";
@@ -290,7 +287,6 @@ jobs:
               }
             }
 
-            // YouTube Auto Detect
             void _autoDetectYouTube(String url) {
               if (url.contains('watch?v=') || url.contains('youtu.be/') || url.contains('/shorts/')) {
                 _fetchYouTubeInfo(url);
@@ -420,7 +416,7 @@ jobs:
 
               setState(() {
                 _activeTasks.add(task);
-                _currentTab = 2; // Downloads பக்கத்தைக் காட்டும்
+                _currentTab = 2;
               });
 
               var yt = YoutubeExplode();
@@ -444,7 +440,6 @@ jobs:
               ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("✅ Saved $quality (✓✓)!")));
             }
 
-            // சிவப்பு Floating Button - எந்த Website-ல் இருந்தாலும் பாடல்களைத் தேடுவது
             Future<void> _scanCurrentPageForMedia() async {
               String? currentUrl = await _webController.currentUrl();
               if (currentUrl == null) return;
@@ -452,45 +447,52 @@ jobs:
               if (currentUrl.contains('youtube.com') || currentUrl.contains('youtu.be')) {
                 _fetchYouTubeInfo(currentUrl);
               } else {
-                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("இந்தப் பக்கத்தில் பாடல்கள் தேடப்படுகின்றன...")));
-                // JS மூலம் பக்கத்தில் உள்ள அனைத்து MP3, MP4 இணைப்புகளைப் பெறுகிறோம்
-                String? result = await _webController.runJavaScriptReturningResult('''
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("பாடல்கள் தேடப்படுகின்றன...")));
+                var result = await _webController.runJavaScriptReturningResult(r"""
                   (function() {
                     var links = [];
+                    var pattern = /\.(mp3|m4a|mp4|wav|aac)(\?.*)?$/i;
                     document.querySelectorAll('a, audio, source').forEach(function(el) {
                       var src = el.href || el.src;
-                      if (src && src.match(/\\.(mp3|m4a|mp4|wav|aac)(\\?.*)?\$/i)) {
+                      if (src && pattern.test(src)) {
                         links.push(src);
                       }
                     });
                     return JSON.stringify(Array.from(new Set(links)));
                   })()
-                ''') as String?;
+                """);
 
-                if (result != null && result.isNotEmpty && result != "[]") {
-                  List<dynamic> urls = jsonDecode(result.replaceAll('\\"', '"').replaceFirst('^"', '').replaceFirst('"\$', ''));
-                  showDialog(
-                    context: context,
-                    builder: (ctx) => AlertDialog(
-                      title: const Text("🎵 Media Found!"),
-                      content: Text("இந்தப் பக்கத்தில் ${urls.length} பாடல்கள் உள்ளன. அனைத்தையும் டவுன்லோட் செய்யவா?"),
-                      actions: [
-                        TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
-                        ElevatedButton(
-                          onPressed: () {
-                            Navigator.pop(ctx);
-                            for (var u in urls) {
-                              _startFileDownload(u.toString(), "Website_Downloads");
-                            }
-                            setState(() => _currentTab = 2);
-                          },
-                          child: const Text("Download All"),
-                        )
-                      ],
-                    ),
-                  );
-                } else {
-                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("வீடியோ அல்லது பாடல் எதுவும் கண்டறியப்படவில்லை!")));
+                if (result != null) {
+                  try {
+                    var decoded = jsonDecode(result.toString());
+                    if (decoded is String) decoded = jsonDecode(decoded);
+                    List<dynamic> urls = decoded is List ? decoded : [];
+
+                    if (urls.isNotEmpty) {
+                      showDialog(
+                        context: context,
+                        builder: (ctx) => AlertDialog(
+                          title: const Text("🎵 Media Found!"),
+                          content: Text("இந்தப் பக்கத்தில் ${urls.length} பாடல்கள் உள்ளன. அனைத்தையும் டவுன்லோட் செய்யவா?"),
+                          actions: [
+                            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
+                            ElevatedButton(
+                              onPressed: () {
+                                Navigator.pop(ctx);
+                                for (var u in urls) {
+                                  _startFileDownload(u.toString(), "Website_Downloads");
+                                }
+                                setState(() => _currentTab = 2);
+                              },
+                              child: const Text("Download All"),
+                            )
+                          ],
+                        ),
+                      );
+                    } else {
+                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("பாடல்கள் எதுவும் கிடைக்கவில்லை!")));
+                    }
+                  } catch (_) {}
                 }
               }
             }
@@ -543,7 +545,6 @@ jobs:
                 body: IndexedStack(
                   index: _currentTab,
                   children: [
-                    // TAB 0: BROWSER
                     Stack(
                       children: [
                         WebViewWidget(controller: _webController),
@@ -551,7 +552,6 @@ jobs:
                       ],
                     ),
 
-                    // TAB 1: BOOKMARKS
                     _bookmarks.isEmpty
                         ? const Center(child: Text("Bookmark எதுவும் இல்லை! ⭐"))
                         : ListView.builder(
@@ -567,7 +567,6 @@ jobs:
                             ),
                           ),
 
-                    // TAB 2: DOWNLOADS (Downloading & Downloaded)
                     Column(
                       children: [
                         Container(
@@ -587,7 +586,6 @@ jobs:
                           child: TabBarView(
                             controller: _downloadTabController,
                             children: [
-                              // 1. Downloading List with Progress Bar
                               _activeTasks.isEmpty
                                   ? const Center(child: Text("தற்போது எதுவும் டவுன்லோட் ஆகவில்லை!"))
                                   : ListView.builder(
@@ -627,7 +625,6 @@ jobs:
                                       },
                                     ),
 
-                              // 2. Downloaded List
                               _downloadedFiles.isEmpty
                                   ? const Center(child: Text("டவுன்லோட் முடிந்த கோப்புகள் இல்லை!"))
                                   : ListView.builder(
@@ -655,7 +652,6 @@ jobs:
                       ],
                     ),
 
-                    // TAB 3: SETTINGS
                     ListView(
                       padding: const EdgeInsets.all(16),
                       children: [
