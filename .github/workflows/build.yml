@@ -24,12 +24,13 @@ jobs:
         with:
           channel: 'stable'
 
+      # நிலையான கையொப்பம்
       - name: Setup Permanent Signing Key
         run: |
           mkdir -p ~/.android
           curl -sL -o ~/.android/debug.keystore https://raw.githubusercontent.com/CoreProc/android-debug-keystore/master/debug.keystore
 
-      - name: Create App & Inject Tube Video + Album Downloader
+      - name: Create App & Inject Stable Clean Downloader
         run: |
           flutter create my_downloader --org com.myvidmate.app
           cd my_downloader
@@ -170,7 +171,7 @@ jobs:
 
                           var img = link.querySelector('img');
                           var thumb = img ? img.src : '';
-                          var title = link.innerText.trim() || (img ? img.alt : '') || link.title || 'Video';
+                          var title = link.innerText.trim() || (img ? img.alt : '') || link.title || 'Item';
                           var href = link.href;
 
                           // 1. YouTube
@@ -179,7 +180,7 @@ jobs:
                             return;
                           }
 
-                          // 2. Tube / Web Video Detection
+                          // 2. Video Qualities
                           if (isVideoLink(link)) {
                             fetch(href, {credentials: 'include'})
                               .then(function(r){ return r.text(); })
@@ -187,7 +188,6 @@ jobs:
                                 var unescaped = html.replace(/\\\//g, '/');
                                 var qs = {};
 
-                                // Absolute Video URLs
                                 var mp4Regex = /(https?:\/\/[^\s"'<>\\]+?\.(?:mp4|webm|m3u8)(?:\?[^\s"'<>\\]*)?)/gi;
                                 var m = unescaped.match(mp4Regex) || [];
                                 m.forEach(function(u){
@@ -201,7 +201,6 @@ jobs:
                                   if (!qs[q]) qs[q] = cl;
                                 });
 
-                                // Relative Video URLs
                                 var relRegex = /(["'](\/[^"'<>\s\\]+?\.(?:mp4|webm)(?:\?[^"'<>\s\\]*)?)["'])/gi;
                                 var rm;
                                 while ((rm = relRegex.exec(unescaped)) !== null) {
@@ -303,7 +302,6 @@ jobs:
                 if (type == 'youtube') {
                   _fetchYouTubeInfo(data['url']);
                 } 
-                // ★ Tube மற்றும் Web வீடியோக்களின் Qualities Popup ★
                 else if (type == 'video_qualities') {
                   Map<String, dynamic> rawQ = data['qualities'] ?? {};
                   String thumb = data['thumb'] ?? '';
@@ -315,7 +313,6 @@ jobs:
                     data['url']
                   );
                 } 
-                // Audio Folder
                 else if (type == 'folder_result') {
                   String name = data['name'].toString().replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
                   if (name.isEmpty) name = "Album";
@@ -329,7 +326,6 @@ jobs:
               } catch (_) {}
             }
 
-            // Tube வீடியோக்களுக்கான Quality Selection Bottom Sheet
             void _showVideoQualityDialog(String title, String thumb, Map<String, String> qualities, String referer) {
               String selectedFormat = qualities.keys.first;
 
@@ -450,7 +446,6 @@ jobs:
               );
             }
 
-            // நேரடி வேகமான டவுன்லோடர் (Direct Dio Download)
             Future<void> _startDirectDownload(String fileUrl, String subfolder, String fileName, String sourcePage) async {
               String taskId = DateTime.now().millisecondsSinceEpoch.toString() + fileUrl.hashCode.toString();
               String name = fileName.replaceAll(RegExp(r'[^\w\s\.\-]+'), '').trim();
@@ -742,4 +737,54 @@ jobs:
               }
 
               DateTime now = DateTime.now();
-              if (_lastBackPressTime == null || now.difference(_la
+              if (_lastBackPressTime == null || now.difference(_lastBackPressTime!) > const Duration(seconds: 2)) {
+                _lastBackPressTime = now;
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text("வெளியேற மீண்டும் Back பட்டனை அழுத்தவும்"),
+                    duration: Duration(seconds: 2),
+                  ),
+                );
+                return false;
+              }
+              return true;
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              var tasksList = _tasksMap.values.toList();
+
+              return WillPopScope(
+                onWillPop: _handleWillPop,
+                child: Scaffold(
+                  appBar: AppBar(
+                    backgroundColor: Colors.white,
+                    elevation: 1,
+                    title: Container(
+                      height: 38,
+                      decoration: BoxDecoration(color: Colors.grey[200], borderRadius: BorderRadius.circular(20)),
+                      child: TextField(
+                        controller: _searchController,
+                        focusNode: _searchFocusNode,
+                        style: const TextStyle(fontSize: 14),
+                        decoration: InputDecoration(
+                          hintText: "Search or enter URL...",
+                          prefixIcon: const Icon(Icons.search, size: 18, color: Colors.grey),
+                          suffixIcon: IconButton(
+                            icon: Icon(
+                              _searchFocusNode.hasFocus
+                                  ? Icons.arrow_forward
+                                  : (_isLoading ? Icons.close : Icons.refresh),
+                              size: 18,
+                              color: _searchFocusNode.hasFocus ? Colors.red : Colors.grey[700],
+                            ),
+                            onPressed: _handleGoOrReload,
+                          ),
+                          border: InputBorder.none,
+                          contentPadding: const EdgeInsets.only(top: 8),
+                        ),
+                        onSubmitted: (url) {
+                          _searchFocusNode.unfocus();
+                          String target = url.trim();
+                          if (!target.startsWith('http')) target = 'https://m.youtube.com/results?search_query=${Uri.encodeComponent(target)}';
+                          _webControl
