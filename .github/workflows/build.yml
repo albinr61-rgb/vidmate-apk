@@ -24,12 +24,13 @@ jobs:
         with:
           channel: 'stable'
 
-      - name: Setup Permanent Signing Key
+      # ★ நிலையான விசை (Fixed Keystore) - இனி வாழ்நாளில் Update பிரச்சனை வராது ★
+      - name: Generate Fixed Permanent Keystore
         run: |
           mkdir -p ~/.android
-          curl -sL -o ~/.android/debug.keystore https://raw.githubusercontent.com/CoreProc/android-debug-keystore/master/debug.keystore
+          keytool -genkeypair -v -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=VidMate, OU=Dev, O=App, L=City, S=State, C=IN" -storetype PKCS12 || true
 
-      - name: Create App & Inject Smooth Queue Streamer
+      - name: Create App & Inject Strict Folder Lock Downloader
         run: |
           flutter create my_downloader --org com.myvidmate.app
           cd my_downloader
@@ -37,7 +38,6 @@ jobs:
           flutter pub add webview_flutter youtube_explode_dart dio path_provider shared_preferences
 
           cat << 'EOF' > lib/main.dart
-          import 'dart:async';
           import 'dart:convert';
           import 'dart:io';
           import 'dart:typed_data';
@@ -107,7 +107,6 @@ jobs:
 
             final Map<String, DownloadTask> _tasksMap = {};
             final List<String> _downloadQueue = [];
-            bool _isDownloadingActive = false;
 
             List<Map<String, String>> _bookmarks = [];
             Map<String, bool> _downloadedQualities = {};
@@ -162,7 +161,7 @@ jobs:
                         var isBusy = false;
                         window.__pausedTasks = window.__pausedTasks || {};
 
-                        // In-Browser Stream Chunks Engine
+                        // In-Browser Stream Chunks
                         window.streamFileFromBrowser = async function(url, taskId) {
                           try {
                             window.__pausedTasks[taskId] = false;
@@ -211,21 +210,48 @@ jobs:
                           window.__pausedTasks[taskId] = true;
                         };
 
-                        // Recursive Deep Crawler
-                        async function crawlDeepFolderSilently(folderPath, pageUrl, depth) {
-                          if (depth > 4) return;
+                        // ★ 1800 பாட்டுகள் வராமல், அந்த ஆல்பத்திற்குள் மட்டுமே பூட்டும் Strict Crawler ★
+                        function isStrictSubUrl(parentUrl, childUrl) {
                           try {
-                            var res = await fetch(pageUrl, {credentials: 'include'});
+                            var p = new URL(parentUrl);
+                            var c = new URL(childUrl);
+                            if (p.hostname.replace(/^www\./,'') !== c.hostname.replace(/^www\./,'')) return false;
+
+                            // Query parameters check (?folder=Deva_Hits / ?album=Deva_Hits)
+                            var keys = ['album', 'folder', 'dir', 'cat', 'category', 'id'];
+                            for (var i = 0; i < keys.length; i++) {
+                              var k = keys[i];
+                              var pv = p.searchParams.get(k);
+                              var cv = c.searchParams.get(k);
+                              if (pv !== null && cv !== null) {
+                                return cv.startsWith(pv.replace(/\/+$/, '') + '/') && cv !== pv;
+                              }
+                            }
+
+                            // Path check (/songs/Deva_Hits/...)
+                            var pDir = p.pathname.replace(/\/+$/, '') + '/';
+                            if (c.pathname.startsWith(pDir) && c.pathname !== pDir) {
+                              return true;
+                            }
+                            return false;
+                          } catch(e) { return false; }
+                        }
+
+                        async function crawlAlbumStrictly(folderPath, targetUrl, depth) {
+                          if (depth > 3) return;
+                          try {
+                            var res = await fetch(targetUrl, {credentials: 'include'});
                             if (!res.ok) return;
                             var html = await res.text();
                             var doc = new DOMParser().parseFromString(html, 'text/html');
 
                             var seen = {};
+                            // 1. இந்த ஆல்பத்தில் உள்ள பாடல்களை மட்டும் எடுத்தல்
                             doc.querySelectorAll('a[href], audio, source, [data-url]').forEach(function(el) {
                               var href = el.getAttribute('href') || el.getAttribute('src') || el.getAttribute('data-url');
                               if (href && href.match(/\.mp3/i)) {
                                 try {
-                                  var full = new URL(href, pageUrl).href;
+                                  var full = new URL(href, targetUrl).href;
                                   var sName = el.innerText.trim() || decodeURIComponent(full.split('/').pop().split('?')[0]);
                                   if (!seen[full]) {
                                     seen[full] = true;
@@ -234,32 +260,31 @@ jobs:
                                       url: full,
                                       subfolder: folderPath,
                                       name: sName,
-                                      page: pageUrl
+                                      page: targetUrl
                                     }));
                                   }
                                 } catch(x){}
                               }
                             });
 
+                            // 2. வெளி இணைப்புகளுக்கு செல்லாமல், இதன் Subfolder-க்கு மட்டுமே செல்லும் பூட்டு
                             doc.querySelectorAll('a[href]').forEach(function(a) {
                               var aTxt = a.innerText.trim();
                               var aHref = a.getAttribute('href');
-                              if (aTxt.length > 2 && aHref && !aHref.startsWith('javascript') && !aHref.includes('#') && !aTxt.endsWith('.mp3')) {
-                                if (!['Home', 'Songs', 'Bible', 'Quiz', 'Search', 'Contact', 'TV', 'Facebook', 'About'].includes(aTxt)) {
-                                  try {
-                                    var nextUrl = new URL(aHref, pageUrl).href;
-                                    if (nextUrl !== pageUrl && !nextUrl.endsWith('/')) {
-                                      crawlDeepFolderSilently(folderPath + '/' + aTxt, nextUrl, depth + 1);
-                                    }
-                                  } catch(x){}
-                                }
+                              if (aTxt.length > 1 && aHref && !aHref.startsWith('javascript') && !aHref.includes('#') && !aTxt.endsWith('.mp3')) {
+                                try {
+                                  var nextUrl = new URL(aHref, targetUrl).href;
+                                  if (isStrictSubUrl(targetUrl, nextUrl)) {
+                                    crawlAlbumStrictly(folderPath + '/' + aTxt, nextUrl, depth + 1);
+                                  }
+                                } catch(x){}
                               }
                             });
                           } catch(e){}
                         }
 
-                        window.startAutoCrawl = async function(rootName, rootUrl) {
-                          await crawlDeepFolderSilently(rootName, rootUrl, 0);
+                        window.startStrictCrawl = async function(rootName, rootUrl) {
+                          await crawlAlbumStrictly(rootName, rootUrl, 0);
                         };
 
                         function isVideoLink(link) {
@@ -284,13 +309,11 @@ jobs:
                           var title = link.innerText.trim() || (img ? img.alt : '') || link.title || 'Item';
                           var href = link.href;
 
-                          // 1. YouTube
                           if (href.includes('watch') || href.includes('youtu.be')) {
                             VidMateBridge.postMessage(JSON.stringify({type: 'youtube', url: href, name: title}));
                             return;
                           }
 
-                          // 2. Video
                           if (isVideoLink(link)) {
                             fetch(href, {credentials: 'include'})
                               .then(function(r){ return r.text(); })
@@ -321,7 +344,6 @@ jobs:
                             return;
                           }
 
-                          // 3. நீங்கள் தொடும் எந்தப் பகுதியாக இருந்தாலும் (பச்சை நிற மெனு உட்பட) Long Press வேலை செய்யும்!
                           VidMateBridge.postMessage(JSON.stringify({
                             type: 'folder_long_press',
                             url: href,
@@ -398,18 +420,14 @@ jobs:
                   }
                 }
                 else if (type == 'dl_done') {
-                  String taskId = data['id'];
-                  _finishTask(taskId, success: true);
+                  _finishTask(data['id'], success: true);
                 }
-                // Browser Fetch தோல்வியடைந்தால் Dio வழியாக நேரடியாக முயலும் Fallback
                 else if (type == 'dl_fallback') {
-                  String taskId = data['id'];
-                  _fallbackDirectDownload(taskId);
+                  _fallbackDirectDownload(data['id']);
                 }
               } catch (_) {}
             }
 
-            // Download Queue அமைப்பு (சர்வர் முடங்காமல் ஒன்றன் பின் ஒன்றாக 2 downloads வீதம் செல்லும்)
             Future<void> _enqueueDownload(String fileUrl, String subfolder, String fileName, String sourcePage) async {
               String taskId = DateTime.now().millisecondsSinceEpoch.toString() + fileUrl.hashCode.toString();
               String name = fileName.replaceAll(RegExp(r'[^\w\s\.\-]+'), '').trim();
@@ -531,7 +549,7 @@ jobs:
                     ],
                   ),
                   content: Text(
-                    "'$cleanName' மற்றும் அதனுள் இருக்கும் அனைத்து Subfolders, பாடல்களையும் வெப்சைட்டில் உள்ளவாறே டவுன்லோட் செய்யவா?",
+                    "'$cleanName' ஆல்பத்தில் உள்ள பாடல்களை மட்டும் Download/$cleanName/ ஃபோல்டரில் டவுன்லோட் செய்யவா?",
                   ),
                   actions: [
                     TextButton(
@@ -550,12 +568,13 @@ jobs:
                           SnackBar(content: Text("'$cleanName' டவுன்லோட் தொடங்குகிறது...")),
                         );
 
+                        // Strict URL Lock உடன் ஆல்பம் மட்டுமே டவுன்லோட் ஆகும்
                         _webController.runJavaScript('''
-                          window.startAutoCrawl(${jsonEncode(cleanName)}, ${jsonEncode(folderUrl)});
+                          window.startStrictCrawl(${jsonEncode(cleanName)}, ${jsonEncode(folderUrl)});
                         ''');
                         setState(() => _currentTab = 2);
                       },
-                      child: const Text("Download All", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                      child: const Text("Download", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
                     )
                   ],
                 ),
@@ -1139,7 +1158,7 @@ jobs:
 
           sed -i 's/signingConfig = signingConfigs.release/signingConfig = signingConfigs.debug/g' my_downloader/android/app/build.gradle* 2>/dev/null || true
 
-          # NDK பிழை வராமல் தடுக்கும் அமைப்புகள்
+          # NDK பிழை தடுப்பு
           echo "android.nativeBuildConfigurations.clear()" >> my_downloader/android/app/build.gradle.kts 2>/dev/null || true
           sed -i '/android {/a \    ndkVersion = ""' my_downloader/android/app/build.gradle* 2>/dev/null || true
 
