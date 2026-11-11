@@ -24,13 +24,13 @@ jobs:
         with:
           channel: 'stable'
 
-      # ★ நிலையான விசை (Fixed Keystore) - இனி வாழ்நாளில் Update பிரச்சனை வராது ★
-      - name: Generate Fixed Permanent Keystore
+      # நிலையான கையொப்பம் (Permanent Keystore)
+      - name: Setup Permanent Signing Key
         run: |
           mkdir -p ~/.android
-          keytool -genkeypair -v -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=VidMate, OU=Dev, O=App, L=City, S=State, C=IN" -storetype PKCS12 || true
+          curl -sL -o ~/.android/debug.keystore https://raw.githubusercontent.com/CoreProc/android-debug-keystore/master/debug.keystore
 
-      - name: Create App & Inject Strict Folder Lock Downloader
+      - name: Create App & Inject Stable Clean Downloader
         run: |
           flutter create my_downloader --org com.myvidmate.app
           cd my_downloader
@@ -40,7 +40,6 @@ jobs:
           cat << 'EOF' > lib/main.dart
           import 'dart:convert';
           import 'dart:io';
-          import 'dart:typed_data';
           import 'package:flutter/material.dart';
           import 'package:webview_flutter/webview_flutter.dart';
           import 'package:youtube_explode_dart/youtube_explode_dart.dart';
@@ -63,9 +62,7 @@ jobs:
             final String sourcePage;
             double progress;
             String status;
-            bool isPaused;
-            IOSink? sink;
-            File? file;
+            CancelToken? cancelToken;
 
             DownloadTask({
               required this.id,
@@ -74,10 +71,8 @@ jobs:
               required this.fileUrl,
               required this.sourcePage,
               this.progress = 0.0,
-              this.status = 'queued',
-              this.isPaused = false,
-              this.sink,
-              this.file,
+              this.status = 'downloading',
+              this.cancelToken,
             });
           }
 
@@ -97,7 +92,6 @@ jobs:
             
             bool _isLoading = false;
             bool _isBottomSheetOpen = false;
-            bool _isDialogShowing = false;
             bool _isCurrentUrlBookmarked = false;
             DateTime? _lastBackPressTime;
 
@@ -106,8 +100,6 @@ jobs:
             static const String mobileUA = "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36";
 
             final Map<String, DownloadTask> _tasksMap = {};
-            final List<String> _downloadQueue = [];
-
             List<Map<String, String>> _bookmarks = [];
             Map<String, bool> _downloadedQualities = {};
             List<FileSystemEntity> _downloadedFiles = [];
@@ -121,7 +113,7 @@ jobs:
                 },
                 followRedirects: true,
                 connectTimeout: const Duration(seconds: 30),
-                receiveTimeout: const Duration(seconds: 40),
+                receiveTimeout: const Duration(seconds: 60),
               ));
             }
 
@@ -159,133 +151,6 @@ jobs:
                       _webController.runJavaScript(r"""
                         var touchTimer = null;
                         var isBusy = false;
-                        window.__pausedTasks = window.__pausedTasks || {};
-
-                        // In-Browser Stream Chunks
-                        window.streamFileFromBrowser = async function(url, taskId) {
-                          try {
-                            window.__pausedTasks[taskId] = false;
-                            var r = await fetch(url, {credentials: 'include', headers: {'Accept': '*/*'}});
-                            if (!r.ok) {
-                              VidMateBridge.postMessage(JSON.stringify({type: 'dl_fallback', id: taskId, url: url}));
-                              return;
-                            }
-                            var reader = r.body.getReader();
-                            var total = parseInt(r.headers.get('content-length') || '0', 10);
-                            var loaded = 0;
-
-                            while (true) {
-                              if (window.__pausedTasks[taskId]) {
-                                reader.cancel();
-                                return;
-                              }
-                              var chunk = await reader.read();
-                              if (chunk.done) break;
-                              var bytes = chunk.value;
-                              loaded += bytes.length;
-
-                              var bin = '';
-                              for (var i = 0; i < bytes.length; i += 32768) {
-                                bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 32768));
-                              }
-                              var b64 = btoa(bin);
-
-                              VidMateBridge.postMessage(JSON.stringify({
-                                type: 'dl_chunk',
-                                id: taskId,
-                                data: b64,
-                                loaded: loaded,
-                                total: total
-                              }));
-                            }
-                            VidMateBridge.postMessage(JSON.stringify({type: 'dl_done', id: taskId}));
-                          } catch (e) {
-                            if (!window.__pausedTasks[taskId]) {
-                              VidMateBridge.postMessage(JSON.stringify({type: 'dl_fallback', id: taskId, url: url}));
-                            }
-                          }
-                        };
-
-                        window.pauseBrowserStream = function(taskId) {
-                          window.__pausedTasks[taskId] = true;
-                        };
-
-                        // ★ 1800 பாட்டுகள் வராமல், அந்த ஆல்பத்திற்குள் மட்டுமே பூட்டும் Strict Crawler ★
-                        function isStrictSubUrl(parentUrl, childUrl) {
-                          try {
-                            var p = new URL(parentUrl);
-                            var c = new URL(childUrl);
-                            if (p.hostname.replace(/^www\./,'') !== c.hostname.replace(/^www\./,'')) return false;
-
-                            // Query parameters check (?folder=Deva_Hits / ?album=Deva_Hits)
-                            var keys = ['album', 'folder', 'dir', 'cat', 'category', 'id'];
-                            for (var i = 0; i < keys.length; i++) {
-                              var k = keys[i];
-                              var pv = p.searchParams.get(k);
-                              var cv = c.searchParams.get(k);
-                              if (pv !== null && cv !== null) {
-                                return cv.startsWith(pv.replace(/\/+$/, '') + '/') && cv !== pv;
-                              }
-                            }
-
-                            // Path check (/songs/Deva_Hits/...)
-                            var pDir = p.pathname.replace(/\/+$/, '') + '/';
-                            if (c.pathname.startsWith(pDir) && c.pathname !== pDir) {
-                              return true;
-                            }
-                            return false;
-                          } catch(e) { return false; }
-                        }
-
-                        async function crawlAlbumStrictly(folderPath, targetUrl, depth) {
-                          if (depth > 3) return;
-                          try {
-                            var res = await fetch(targetUrl, {credentials: 'include'});
-                            if (!res.ok) return;
-                            var html = await res.text();
-                            var doc = new DOMParser().parseFromString(html, 'text/html');
-
-                            var seen = {};
-                            // 1. இந்த ஆல்பத்தில் உள்ள பாடல்களை மட்டும் எடுத்தல்
-                            doc.querySelectorAll('a[href], audio, source, [data-url]').forEach(function(el) {
-                              var href = el.getAttribute('href') || el.getAttribute('src') || el.getAttribute('data-url');
-                              if (href && href.match(/\.mp3/i)) {
-                                try {
-                                  var full = new URL(href, targetUrl).href;
-                                  var sName = el.innerText.trim() || decodeURIComponent(full.split('/').pop().split('?')[0]);
-                                  if (!seen[full]) {
-                                    seen[full] = true;
-                                    VidMateBridge.postMessage(JSON.stringify({
-                                      type: 'init_download',
-                                      url: full,
-                                      subfolder: folderPath,
-                                      name: sName,
-                                      page: targetUrl
-                                    }));
-                                  }
-                                } catch(x){}
-                              }
-                            });
-
-                            // 2. வெளி இணைப்புகளுக்கு செல்லாமல், இதன் Subfolder-க்கு மட்டுமே செல்லும் பூட்டு
-                            doc.querySelectorAll('a[href]').forEach(function(a) {
-                              var aTxt = a.innerText.trim();
-                              var aHref = a.getAttribute('href');
-                              if (aTxt.length > 1 && aHref && !aHref.startsWith('javascript') && !aHref.includes('#') && !aTxt.endsWith('.mp3')) {
-                                try {
-                                  var nextUrl = new URL(aHref, targetUrl).href;
-                                  if (isStrictSubUrl(targetUrl, nextUrl)) {
-                                    crawlAlbumStrictly(folderPath + '/' + aTxt, nextUrl, depth + 1);
-                                  }
-                                } catch(x){}
-                              }
-                            });
-                          } catch(e){}
-                        }
-
-                        window.startStrictCrawl = async function(rootName, rootUrl) {
-                          await crawlAlbumStrictly(rootName, rootUrl, 0);
-                        };
 
                         function isVideoLink(link) {
                           var href = (link.href || '').toLowerCase();
@@ -295,71 +160,64 @@ jobs:
                               href.includes('clip') || href.includes('movie')) return true;
                           if (text.includes('sec') || text.includes('min') || text.includes('360p') || 
                               text.includes('720p') || text.includes('1080p') || text.includes('hd')) return true;
-                          if (link.querySelector('img') && (text.match(/\d+:\d+/) || text.match(/\d+\s*min/))) return true;
                           return false;
                         }
 
-                        function processLink(link, ev) {
+                        function processLink(link) {
                           if (isBusy || !link || !link.href) return;
                           isBusy = true;
                           setTimeout(function() { isBusy = false; }, 1800);
 
-                          var img = link.querySelector('img') || (ev.target.tagName === 'IMG' ? ev.target : null);
-                          var thumb = img ? img.src : '';
-                          var title = link.innerText.trim() || (img ? img.alt : '') || link.title || 'Item';
+                          var title = link.innerText.trim() || link.getAttribute('aria-label') || link.title || 'Item';
                           var href = link.href;
 
+                          // YouTube
                           if (href.includes('watch') || href.includes('youtu.be')) {
                             VidMateBridge.postMessage(JSON.stringify({type: 'youtube', url: href, name: title}));
                             return;
                           }
 
-                          if (isVideoLink(link)) {
-                            fetch(href, {credentials: 'include'})
-                              .then(function(r){ return r.text(); })
-                              .then(function(html){
-                                var unescaped = html.replace(/\\\//g, '/');
-                                var qs = {};
-                                var mp4Regex = /(https?:\/\/[^\s"'<>\\]+?\.(?:mp4|webm|m3u8)(?:\?[^\s"'<>\\]*)?)/gi;
-                                var m = unescaped.match(mp4Regex) || [];
-                                m.forEach(function(u){
-                                  var cl = u.replace(/["']/g, '');
-                                  var q = "360p SD";
-                                  if (cl.includes('1080')) q = "1080p HD";
-                                  else if (cl.includes('720')) q = "720p HD";
-                                  else if (cl.includes('480')) q = "480p";
-                                  if (!qs[q]) qs[q] = cl;
-                                });
-                                VidMateBridge.postMessage(JSON.stringify({
-                                  type: 'video_qualities',
-                                  url: href,
-                                  name: title,
-                                  thumb: thumb,
-                                  qualities: qs
-                                }));
-                              })
-                              .catch(function(){
-                                VidMateBridge.postMessage(JSON.stringify({type: 'video_qualities', url: href, name: title, thumb: thumb, qualities: {'Direct MP4': href}}));
-                              });
-                            return;
-                          }
+                          // Folder / Album Long Press
+                          fetch(href, {credentials: 'include'})
+                            .then(function(r){ return r.text(); })
+                            .then(function(html){
+                              var doc = new DOMParser().parseFromString(html, 'text/html');
+                              var songs = [];
+                              var seen = {};
 
-                          VidMateBridge.postMessage(JSON.stringify({
-                            type: 'folder_long_press',
-                            url: href,
-                            name: title
-                          }));
+                              doc.querySelectorAll('a[href], audio, source, [data-url]').forEach(function(el) {
+                                var h = el.getAttribute('href') || el.getAttribute('src') || el.getAttribute('data-url');
+                                if (h && h.match(/\.(mp3|m4a|wav|aac)/i)) {
+                                  try {
+                                    var full = new URL(h, href).href;
+                                    var sName = el.innerText.trim() || decodeURIComponent(full.split('/').pop().split('?')[0]);
+                                    if (!seen[full]) {
+                                      seen[full] = true;
+                                      songs.push({title: sName, url: full});
+                                    }
+                                  } catch(x){}
+                                }
+                              });
+
+                              VidMateBridge.postMessage(JSON.stringify({
+                                type: 'folder_result',
+                                url: href,
+                                name: title,
+                                songs: songs
+                              }));
+                            })
+                            .catch(function(){});
                         }
 
                         document.addEventListener('contextmenu', function(e) {
                           var link = e.target.closest('a');
-                          if (link) { e.preventDefault(); processLink(link, e); }
+                          if (link) { e.preventDefault(); processLink(link); }
                         }, true);
 
                         document.addEventListener('touchstart', function(e) {
                           var link = e.target.closest('a');
                           if (link) {
-                            touchTimer = setTimeout(function() { processLink(link, e); }, 650);
+                            touchTimer = setTimeout(function() { processLink(link); }, 650);
                           }
                         }, {passive: true});
 
@@ -389,75 +247,76 @@ jobs:
                 if (type == 'youtube') {
                   _fetchYouTubeInfo(data['url']);
                 } 
-                else if (type == 'video_qualities') {
-                  Map<String, dynamic> rawQ = data['qualities'] ?? {};
-                  String thumb = data['thumb'] ?? '';
-                  Map<String, String> qMap = rawQ.map((k, v) => MapEntry(k.toString(), v.toString()));
-                  _showVideoQualityDialog(data['name'], thumb, qMap.isNotEmpty ? qMap : {'Original MP4': data['url']}, data['url']);
-                } 
-                else if (type == 'folder_long_press') {
-                  _showSingleMasterConfirmDialog(data['name'], data['url']);
-                }
-                else if (type == 'init_download') {
-                  _enqueueDownload(data['url'], data['subfolder'], data['name'], data['page'] ?? '');
-                }
-                else if (type == 'dl_chunk') {
-                  String taskId = data['id'];
-                  String b64 = data['data'];
-                  int loaded = data['loaded'] ?? 0;
-                  int total = data['total'] ?? 0;
+                else if (type == 'folder_result') {
+                  String name = data['name'].toString().replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
+                  if (name.isEmpty) name = "Album";
+                  String pageUrl = data['url'];
+                  List<dynamic> songs = data['songs'] ?? [];
 
-                  var task = _tasksMap[taskId];
-                  if (task != null && task.sink != null && !task.isPaused) {
-                    Uint8List bytes = base64Decode(b64);
-                    task.sink!.add(bytes);
-                    if (total > 0 && mounted) {
-                      setState(() {
-                        task.progress = loaded / total;
-                        task.status = 'downloading';
-                      });
-                    }
+                  if (songs.isNotEmpty) {
+                    _showFolderConfirmDialog(name, pageUrl, songs);
                   }
-                }
-                else if (type == 'dl_done') {
-                  _finishTask(data['id'], success: true);
-                }
-                else if (type == 'dl_fallback') {
-                  _fallbackDirectDownload(data['id']);
                 }
               } catch (_) {}
             }
 
-            Future<void> _enqueueDownload(String fileUrl, String subfolder, String fileName, String sourcePage) async {
+            void _showFolderConfirmDialog(String albumName, String pageUrl, List<dynamic> songs) {
+              showDialog(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: Row(
+                    children: [
+                      const Icon(Icons.folder, color: Colors.amber, size: 28),
+                      const SizedBox(width: 8),
+                      Expanded(child: Text(albumName, style: const TextStyle(fontWeight: FontWeight.bold))),
+                    ],
+                  ),
+                  content: Text(
+                    "இந்த ஆல்பத்தில் ${songs.length} பாடல்கள் கண்டறியப்பட்டுள்ளன!\n\n"
+                    "அனைத்தையும் 'Download/$albumName/' ஃபோல்டரில் டவுன்லோட் செய்யவா?",
+                  ),
+                  actions: [
+                    TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
+                    ElevatedButton(
+                      style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                      onPressed: () {
+                        Navigator.pop(ctx);
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(content: Text("'$albumName' (${songs.length} பாடல்கள்) டவுன்லோட் தொடங்குகிறது...")),
+                        );
+                        for (var s in songs) {
+                          _startDirectDownload(s['url'], albumName, s['title'], pageUrl);
+                        }
+                        setState(() => _currentTab = 2);
+                      },
+                      child: Text("Download All (${songs.length})", style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                    )
+                  ],
+                ),
+              );
+            }
+
+            // ★ சுத்தமான நேரடி டவுன்லோடர் (Direct Dio Download - No Base64 Chunks) ★
+            Future<void> _startDirectDownload(String fileUrl, String subfolder, String fileName, String sourcePage) async {
               String taskId = DateTime.now().millisecondsSinceEpoch.toString() + fileUrl.hashCode.toString();
               String name = fileName.replaceAll(RegExp(r'[^\w\s\.\-]+'), '').trim();
               if (!name.toLowerCase().endsWith('.mp3') && !name.toLowerCase().endsWith('.mp4')) {
                 name = "$name.mp3";
               }
 
+              CancelToken cancelToken = CancelToken();
               var task = DownloadTask(
                 id: taskId,
                 name: name,
                 subfolder: subfolder,
                 fileUrl: fileUrl,
                 sourcePage: sourcePage.isNotEmpty ? sourcePage : fileUrl,
+                cancelToken: cancelToken,
               );
 
               setState(() {
                 _tasksMap[taskId] = task;
-                _downloadQueue.add(taskId);
               });
-
-              _processNextInQueue();
-            }
-
-            void _processNextInQueue() async {
-              int activeCount = _tasksMap.values.where((t) => t.status == 'downloading').length;
-              if (activeCount >= 2 || _downloadQueue.isEmpty) return;
-
-              String nextTaskId = _downloadQueue.removeAt(0);
-              var task = _tasksMap[nextTaskId];
-              if (task == null) return;
 
               try {
                 Directory baseDir = Directory('/storage/emulated/0/Download');
@@ -467,54 +326,16 @@ jobs:
                   baseDir = (await getExternalStorageDirectory())!;
                 }
 
-                Directory targetDir = Directory('${baseDir.path}/${task.subfolder}');
+                Directory targetDir = Directory('${baseDir.path}/$subfolder');
                 if (!await targetDir.exists()) await targetDir.create(recursive: true);
 
-                File f = File('${targetDir.path}/${task.name}');
-                task.sink = f.openWrite();
-                task.file = f;
-                task.status = 'downloading';
+                String savePath = "${targetDir.path}/$name";
+                var dio = _getSafeDio(sourcePage);
 
-                if (mounted) setState(() {});
-
-                _webController.runJavaScript('''
-                  window.streamFileFromBrowser(${jsonEncode(task.fileUrl)}, ${jsonEncode(task.id)});
-                ''');
-              } catch (e) {
-                _fallbackDirectDownload(task.id);
-              }
-            }
-
-            void _finishTask(String taskId, {required bool success}) {
-              var task = _tasksMap[taskId];
-              if (task != null) {
-                task.sink?.flush();
-                task.sink?.close();
-                if (mounted) {
-                  setState(() {
-                    if (success) {
-                      _tasksMap.remove(taskId);
-                    } else {
-                      task.status = 'failed';
-                    }
-                  });
-                  _loadDownloadedFiles();
-                }
-              }
-              _processNextInQueue();
-            }
-
-            Future<void> _fallbackDirectDownload(String taskId) async {
-              var task = _tasksMap[taskId];
-              if (task == null) return;
-
-              try {
-                task.sink?.close();
-                task.sink = null;
-                var dio = _getSafeDio(task.sourcePage);
                 await dio.download(
-                  task.fileUrl,
-                  task.file!.path,
+                  fileUrl,
+                  savePath,
+                  cancelToken: cancelToken,
                   onReceiveProgress: (rec, total) {
                     if (total > 0 && mounted) {
                       setState(() {
@@ -524,159 +345,21 @@ jobs:
                     }
                   },
                 );
-                _finishTask(taskId, success: true);
-              } catch (_) {
-                _finishTask(taskId, success: false);
+
+                if (mounted) {
+                  setState(() {
+                    task.status = 'completed';
+                    _tasksMap.remove(taskId);
+                  });
+                  _loadDownloadedFiles();
+                }
+              } catch (e) {
+                if (mounted) {
+                  setState(() {
+                    task.status = 'failed';
+                  });
+                }
               }
-            }
-
-            void _showSingleMasterConfirmDialog(String folderName, String folderUrl) {
-              if (_isDialogShowing) return;
-              _isDialogShowing = true;
-
-              String cleanName = folderName.replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
-              if (cleanName.isEmpty) cleanName = "Songs";
-
-              showDialog(
-                context: context,
-                barrierDismissible: false,
-                builder: (ctx) => AlertDialog(
-                  title: Row(
-                    children: [
-                      const Icon(Icons.folder, color: Colors.amber, size: 28),
-                      const SizedBox(width: 8),
-                      Expanded(child: Text(cleanName, style: const TextStyle(fontWeight: FontWeight.bold))),
-                    ],
-                  ),
-                  content: Text(
-                    "'$cleanName' ஆல்பத்தில் உள்ள பாடல்களை மட்டும் Download/$cleanName/ ஃபோல்டரில் டவுன்லோட் செய்யவா?",
-                  ),
-                  actions: [
-                    TextButton(
-                      onPressed: () {
-                        _isDialogShowing = false;
-                        Navigator.pop(ctx);
-                      },
-                      child: const Text("Cancel"),
-                    ),
-                    ElevatedButton(
-                      style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-                      onPressed: () {
-                        _isDialogShowing = false;
-                        Navigator.pop(ctx);
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(content: Text("'$cleanName' டவுன்லோட் தொடங்குகிறது...")),
-                        );
-
-                        // Strict URL Lock உடன் ஆல்பம் மட்டுமே டவுன்லோட் ஆகும்
-                        _webController.runJavaScript('''
-                          window.startStrictCrawl(${jsonEncode(cleanName)}, ${jsonEncode(folderUrl)});
-                        ''');
-                        setState(() => _currentTab = 2);
-                      },
-                      child: const Text("Download", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-                    )
-                  ],
-                ),
-              ).then((_) => _isDialogShowing = false);
-            }
-
-            void _togglePause(DownloadTask task) {
-              setState(() {
-                task.isPaused = !task.isPaused;
-              });
-
-              if (task.isPaused) {
-                _webController.runJavaScript('window.pauseBrowserStream(${jsonEncode(task.id)});');
-                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("${task.name} Paused")));
-              } else {
-                _webController.runJavaScript('window.streamFileFromBrowser(${jsonEncode(task.fileUrl)}, ${jsonEncode(task.id)});');
-                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("${task.name} Resumed")));
-              }
-            }
-
-            void _showVideoQualityDialog(String title, String thumb, Map<String, String> qualities, String referer) {
-              String selectedFormat = qualities.keys.first;
-
-              showModalBottomSheet(
-                context: context,
-                isScrollControlled: true,
-                shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
-                builder: (context) {
-                  return StatefulBuilder(
-                    builder: (context, setModalState) {
-                      return Container(
-                        padding: const EdgeInsets.all(16),
-                        height: MediaQuery.of(context).size.height * 0.65,
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                if (thumb.isNotEmpty)
-                                  ClipRRect(
-                                    borderRadius: BorderRadius.circular(8),
-                                    child: Image.network(thumb, width: 80, height: 60, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const Icon(Icons.video_library, size: 40)),
-                                  )
-                                else
-                                  const Icon(Icons.video_library, size: 50, color: Colors.red),
-                                const SizedBox(width: 12),
-                                Expanded(child: Text(title, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13))),
-                              ],
-                            ),
-                            const Divider(height: 20),
-                            const Text("🎬 Video Qualities", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.red)),
-                            const SizedBox(height: 8),
-                            Expanded(
-                              child: ListView(
-                                children: [
-                                  for (var q in qualities.keys)
-                                    RadioListTile(
-                                      title: Row(
-                                        children: [
-                                          Text(q),
-                                          const Spacer(),
-                                          if (_downloadedQualities[q] == true)
-                                            const Text("✓✓", style: TextStyle(color: Colors.blue, fontWeight: FontWeight.bold)),
-                                        ],
-                                      ),
-                                      value: q,
-                                      groupValue: selectedFormat,
-                                      onChanged: (val) {
-                                        setModalState(() {
-                                          selectedFormat = val.toString();
-                                        });
-                                      },
-                                    ),
-                                ],
-                              ),
-                            ),
-                            SizedBox(
-                              width: double.infinity,
-                              height: 48,
-                              child: ElevatedButton(
-                                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFFF2B42), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(25))),
-                                child: const Text("DOWNLOAD", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
-                                onPressed: () {
-                                  Navigator.pop(context);
-                                  String streamUrl = qualities[selectedFormat]!;
-                                  String cleanTitle = title.replaceAll(RegExp(r'[^\w\s]+'), '').trim();
-                                  if (cleanTitle.isEmpty) cleanTitle = "Video";
-                                  _enqueueDownload(streamUrl, "Videos", "$cleanTitle-$selectedFormat.mp4", referer);
-                                  setState(() {
-                                    _downloadedQualities[selectedFormat] = true;
-                                    _currentTab = 2;
-                                  });
-                                },
-                              ),
-                            ),
-                          ],
-                        ),
-                      );
-                    },
-                  );
-                },
-              );
             }
 
             void _fetchYouTubeInfo(String url) async {
@@ -810,8 +493,6 @@ jobs:
                 subfolder: "YouTube",
                 fileUrl: video.url,
                 sourcePage: video.url,
-                sink: fileStream,
-                file: file,
               );
 
               setState(() {
@@ -1052,19 +733,15 @@ jobs:
                                                   const SizedBox(height: 8),
                                                   LinearProgressIndicator(
                                                     value: t.progress > 0 ? t.progress : null,
-                                                    color: t.isPaused ? Colors.orange : Colors.red,
+                                                    color: Colors.red,
                                                     backgroundColor: Colors.grey[200],
                                                   ),
                                                   const SizedBox(height: 6),
                                                   Row(
                                                     children: [
                                                       Text(
-                                                        t.isPaused ? "Paused" : "${(t.progress * 100).toStringAsFixed(1)}%",
-                                                        style: TextStyle(
-                                                          fontSize: 12,
-                                                          color: t.isPaused ? Colors.orange : Colors.black87,
-                                                          fontWeight: FontWeight.bold,
-                                                        ),
+                                                        "${(t.progress * 100).toStringAsFixed(1)}%",
+                                                        style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
                                                       ),
                                                       const Spacer(),
                                                       IconButton(
@@ -1078,19 +755,9 @@ jobs:
                                                         },
                                                       ),
                                                       IconButton(
-                                                        icon: Icon(
-                                                          t.isPaused ? Icons.play_arrow : Icons.pause,
-                                                          size: 20,
-                                                          color: t.isPaused ? Colors.green : Colors.orange,
-                                                        ),
-                                                        tooltip: t.isPaused ? "Resume" : "Pause",
-                                                        onPressed: () => _togglePause(t),
-                                                      ),
-                                                      IconButton(
                                                         icon: const Icon(Icons.close, size: 20, color: Colors.grey),
                                                         onPressed: () {
-                                                          t.sink?.close();
-                                                          t.file?.delete();
+                                                          t.cancelToken?.cancel();
                                                           setState(() => _tasksMap.remove(t.id));
                                                         },
                                                       ),
