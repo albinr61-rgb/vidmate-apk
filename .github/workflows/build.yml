@@ -24,7 +24,7 @@ jobs:
         with:
           channel: 'stable'
 
-      - name: Create App & Inject Batch Subfolder Downloader
+      - name: Create App & Inject Robust Album Downloader
         run: |
           flutter create my_downloader --org com.myvidmate.app
           cd my_downloader
@@ -54,6 +54,7 @@ jobs:
             final String subfolder;
             double progress;
             String status;
+            String errorMsg;
             CancelToken? cancelToken;
 
             DownloadTask({
@@ -62,6 +63,7 @@ jobs:
               required this.subfolder,
               this.progress = 0.0,
               this.status = 'downloading',
+              this.errorMsg = '',
               this.cancelToken,
             });
           }
@@ -99,7 +101,7 @@ jobs:
                 },
                 followRedirects: true,
                 connectTimeout: const Duration(seconds: 30),
-                receiveTimeout: const Duration(seconds: 40),
+                receiveTimeout: const Duration(seconds: 60),
               ));
             }
 
@@ -125,11 +127,12 @@ jobs:
                       _searchController.text = url;
                     },
                     onPageFinished: (url) {
+                      // Menu Bar-ஐ தவிர்த்து, சரியான பாடல் URL-களை எடுக்கும் JS எஞ்சின்
                       _webController.runJavaScript(r"""
                         var touchTimer = null;
                         var isBusy = false;
 
-                        // 242 ஆல்பங்களையும் பின்னணியில் வரிசையாக டவுன்லோட் செய்யும் Batch Engine
+                        // 1. ஆல்பத்திற்குள் உள்ள அனைத்து பாடல்களையும் சரியான URL உடன் எடுப்பது
                         window.startBatchCrawl = async function(rootName, albums) {
                           for (var i = 0; i < albums.length; i++) {
                             var alb = albums[i];
@@ -137,22 +140,50 @@ jobs:
                               var res = await fetch(alb.url, {credentials: 'include'});
                               if (!res.ok) continue;
                               var html = await res.text();
-                              var matches = html.match(/[^\s"\'<>\\\/=]+\.mp3/gi) || [];
+                              var doc = new DOMParser().parseFromString(html, 'text/html');
+
                               var seen = {};
-                              matches.forEach(function(m) {
-                                var full = new URL(m, alb.url).href;
-                                var sName = decodeURIComponent(m.split('?')[0]);
-                                if (!seen[full]) {
-                                  seen[full] = true;
-                                  VidMateBridge.postMessage(JSON.stringify({
-                                    type: 'queue_download',
-                                    url: full,
-                                    subfolder: rootName + '/' + alb.name,
-                                    name: sName,
-                                    referer: alb.url
-                                  }));
+
+                              // அ. direct links, audio, source tags
+                              doc.querySelectorAll('a[href], audio, source, [data-url]').forEach(function(el) {
+                                var href = el.getAttribute('href') || el.getAttribute('src') || el.getAttribute('data-url');
+                                if (href && href.match(/\.mp3/i)) {
+                                  try {
+                                    var full = new URL(href, alb.url).href;
+                                    var sName = el.innerText.trim() || decodeURIComponent(full.split('/').pop().split('?')[0]);
+                                    if (!seen[full]) {
+                                      seen[full] = true;
+                                      VidMateBridge.postMessage(JSON.stringify({
+                                        type: 'queue_download',
+                                        url: full,
+                                        subfolder: rootName + '/' + alb.name,
+                                        name: sName,
+                                        referer: alb.url
+                                      }));
+                                    }
+                                  } catch(x){}
                                 }
                               });
+
+                              // ஆ. HTML-ல் உள்ள முழு mp3 paths (songs/MyGM/...)
+                              var re = /["']([^"'<>\s]+\.mp3(?:\?[^"'<>\s]*)?)["']/gi;
+                              var m;
+                              while ((m = re.exec(html))) {
+                                try {
+                                  var full = new URL(m[1].replace(/&amp;/g, '&'), alb.url).href;
+                                  var sName = decodeURIComponent(full.split('/').pop().split('?')[0]);
+                                  if (!seen[full]) {
+                                    seen[full] = true;
+                                    VidMateBridge.postMessage(JSON.stringify({
+                                      type: 'queue_download',
+                                      url: full,
+                                      subfolder: rootName + '/' + alb.name,
+                                      name: sName,
+                                      referer: alb.url
+                                    }));
+                                  }
+                                } catch(x){}
+                              }
                             } catch(e) {}
                           }
                         };
@@ -185,7 +216,7 @@ jobs:
                             return;
                           }
 
-                          // 2. Video Qualities
+                          // 2. Video
                           if (isVideoLink(link)) {
                             fetch(href, {credentials: 'include'})
                               .then(function(r){ return r.text(); })
@@ -217,27 +248,38 @@ jobs:
                             return;
                           }
 
-                          // 3. Folder Crawl
+                          // 3. Folder Crawl (Menu Bar-ஐ தவிர்த்து உண்மையான ஆல்பங்களை மட்டும் எடுக்கும் முறை)
                           fetch(href, {credentials: 'include'})
                             .then(function(r){ return r.text(); })
                             .then(function(html){
-                              var sMatches = html.match(/[^\s"\'<>\\\/=]+\.mp3/gi) || [];
+                              var doc = new DOMParser().parseFromString(html, 'text/html');
                               var songs = [];
-                              sMatches.forEach(function(file){
-                                var full = new URL(file, href).href;
-                                var name = decodeURIComponent(file.split('?')[0]);
-                                if (!songs.some(function(s){ return s.url === full; })) {
-                                  songs.push({title: name, url: full});
+                              var seenS = {};
+
+                              doc.querySelectorAll('a[href], audio, source').forEach(function(el) {
+                                var h = el.getAttribute('href') || el.getAttribute('src');
+                                if (h && h.match(/\.mp3/i)) {
+                                  try {
+                                    var full = new URL(h, href).href;
+                                    var name = el.innerText.trim() || decodeURIComponent(full.split('/').pop().split('?')[0]);
+                                    if (!seenS[full]) {
+                                      seenS[full] = true;
+                                      songs.push({title: name, url: full});
+                                    }
+                                  } catch(x){}
                                 }
                               });
 
+                              // Menu Bar Skip: header, nav, menu-ல் இருக்கும் பிற மொழிகளைத் தவிர்த்தல்
                               var subAlbums = [];
-                              var doc = new DOMParser().parseFromString(html, 'text/html');
+                              var skipSelector = 'nav, header, footer, [class*="menu"], [id*="menu"], [class*="nav"], [id*="nav"]';
                               doc.querySelectorAll('a').forEach(function(a){
                                 var txt = a.innerText.trim();
                                 if (txt.length > 1 && a.href && !a.href.startsWith('javascript') && !a.href.includes('#')) {
-                                  if (!['Home', 'Songs', 'Bible', 'Quiz', 'Search', 'Contact', 'TV', 'Facebook'].includes(txt)) {
-                                    if (!txt.endsWith('.mp3')) subAlbums.push({name: txt, url: a.href});
+                                  if (!a.closest(skipSelector)) {
+                                    if (!['Home', 'Songs', 'Bible', 'Quiz', 'Search', 'Contact', 'TV', 'Facebook', 'About'].includes(txt)) {
+                                      if (!txt.endsWith('.mp3')) subAlbums.push({name: txt, url: a.href});
+                                    }
                                   }
                                 }
                               });
@@ -293,7 +335,6 @@ jobs:
                   List<dynamic> subAlbums = data['subAlbums'] ?? [];
                   _showFolderDialog(data['name'], data['url'], songs, subAlbums);
                 }
-                // பின்னணியில் ஆல்பங்கள் வரிசையாக டவுன்லோட் ஆவது
                 else if (type == 'queue_download') {
                   String fileUrl = data['url'];
                   String subfolder = data['subfolder'];
@@ -388,7 +429,6 @@ jobs:
               );
             }
 
-            // ★ நீங்கள் கேட்டபடி "Open Album" நீக்கப்பட்டு "Download All (242 Albums)" வைக்கப்பட்டுள்ளது ★
             void _showFolderDialog(String folderName, String folderUrl, List<dynamic> songs, List<dynamic> subAlbums) {
               String cleanName = folderName.replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
               if (cleanName.isEmpty) cleanName = "Album";
@@ -424,7 +464,6 @@ jobs:
                   ),
                 );
               } 
-              // 242 Albums பட்டியல் இருக்கும் போது
               else if (subAlbums.isNotEmpty) {
                 showDialog(
                   context: context,
@@ -438,7 +477,7 @@ jobs:
                     ),
                     content: Text(
                       "இதில் ${subAlbums.length} Albums உள்ளன (Aalayamani, Amaithikaaga...).\n\n"
-                      "அனைத்து Albums மற்றும் அதனுள் இருக்கும் பாடல்களையும் 'Download/$cleanName/' மெயின் Folder-க்குள் Subfolders அமைப்பில் டவுன்லோட் செய்யவா?",
+                      "அனைத்து Albums-களையும் 'Download/$cleanName/' ஃபோல்டருக்குள் Subfolders அமைப்பில் டவுன்லோட் செய்யவா?",
                     ),
                     actions: [
                       TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
@@ -449,12 +488,11 @@ jobs:
                           ScaffoldMessenger.of(context).showSnackBar(
                             SnackBar(content: Text("'$cleanName': ${subAlbums.length} Albums டவுன்லோட் துவங்குகிறது...")),
                           );
-                          // 242 Albums-களையும் பின்னணியில் தானாகச் சென்று டவுன்லோட் செய்கிறது
                           String albumsJson = jsonEncode(subAlbums);
                           _webController.runJavaScript('''
                             window.startBatchCrawl(${jsonEncode(cleanName)}, $albumsJson);
                           ''');
-                          setState(() => _currentTab = 2); // Downloads பக்கத்திற்கு அழைத்துச் செல்லும்
+                          setState(() => _currentTab = 2);
                         },
                         child: Text("Download All (${subAlbums.length} Albums)", style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
                       )
@@ -464,9 +502,12 @@ jobs:
               }
             }
 
+            // ★ Permission Denied வராமல் மற்றும் தவறான URL இல்லாத பாதுகாப்பான டவுன்லோடர் ★
             Future<void> _startFileDownload(String fileUrl, String subfolder, String referer, {String? fileName}) async {
               String name = fileName ?? Uri.decodeComponent(fileUrl.split('/').last.split('?').first);
-              if (!name.contains('.')) name = "$name.mp3";
+              if (!name.toLowerCase().endsWith('.mp3') && !name.toLowerCase().endsWith('.mp4')) {
+                name = "$name.mp3";
+              }
               name = name.replaceAll(RegExp(r'[^\w\s\.\-]+'), '').trim();
 
               CancelToken cancelToken = CancelToken();
@@ -482,11 +523,20 @@ jobs:
               });
 
               try {
+                // Android 11+ Permission Denied வராமல் தடுக்கும் வழிமுறை
                 Directory baseDir = Directory('/storage/emulated/0/Download');
-                if (!await baseDir.exists()) baseDir = (await getExternalStorageDirectory())!;
-                
+                try {
+                  if (!await baseDir.exists()) {
+                    baseDir = (await getExternalStorageDirectory())!;
+                  }
+                } catch (_) {
+                  baseDir = (await getExternalStorageDirectory())!;
+                }
+
                 Directory targetDir = Directory('${baseDir.path}/$subfolder');
-                if (!await targetDir.exists()) await targetDir.create(recursive: true);
+                if (!await targetDir.exists()) {
+                  await targetDir.create(recursive: true);
+                }
 
                 String savePath = "${targetDir.path}/$name";
 
@@ -496,7 +546,7 @@ jobs:
                   savePath,
                   cancelToken: cancelToken,
                   onReceiveProgress: (received, total) {
-                    if (total > 0) {
+                    if (total > 0 && mounted) {
                       setState(() {
                         task.progress = received / total;
                       });
@@ -504,16 +554,21 @@ jobs:
                   },
                 );
 
-                setState(() {
-                  task.status = 'completed';
-                  _activeTasks.remove(task);
-                });
-                _loadDownloadedFiles();
-              } catch (_) {
-                setState(() {
-                  task.status = 'failed';
-                  _activeTasks.remove(task);
-                });
+                if (mounted) {
+                  setState(() {
+                    task.status = 'completed';
+                    _activeTasks.remove(task);
+                  });
+                  _loadDownloadedFiles();
+                }
+              } catch (e) {
+                // தவறுதலாக அமைதியாக மறையாமல் Error Message-ஐ திரையில் காட்டும்
+                if (mounted) {
+                  setState(() {
+                    task.status = 'failed';
+                    task.errorMsg = e.toString();
+                  });
+                }
               }
             }
 
@@ -653,9 +708,9 @@ jobs:
               var yt = YoutubeExplode();
               var stream = yt.videos.streamsClient.get(streamInfo);
 
-              Directory dir = Directory('/storage/emulated/0/Download');
-              if (!await dir.exists()) dir = (await getExternalStorageDirectory())!;
-              var file = File('${dir.path}/$fileName');
+              Directory baseDir = Directory('/storage/emulated/0/Download');
+              if (!await baseDir.exists()) baseDir = (await getExternalStorageDirectory())!;
+              var file = File('${baseDir.path}/$fileName');
 
               var fileStream = file.openWrite();
               await stream.pipe(fileStream);
@@ -816,6 +871,7 @@ jobs:
                                       itemCount: _activeTasks.length,
                                       itemBuilder: (ctx, i) {
                                         var t = _activeTasks[i];
+                                        bool isErr = t.status == 'failed';
                                         return Card(
                                           margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                                           child: Padding(
@@ -827,9 +883,28 @@ jobs:
                                                 const SizedBox(height: 4),
                                                 Text("📁 Folder: ${t.subfolder}", style: const TextStyle(fontSize: 12, color: Colors.blue)),
                                                 const SizedBox(height: 8),
-                                                LinearProgressIndicator(value: t.progress > 0 ? t.progress : null, color: Colors.red),
+                                                LinearProgressIndicator(
+                                                  value: t.progress > 0 ? t.progress : null,
+                                                  color: isErr ? Colors.grey : Colors.red,
+                                                  backgroundColor: Colors.grey[200],
+                                                ),
                                                 const SizedBox(height: 6),
-                                                Text("${(t.progress * 100).toStringAsFixed(1)}%"),
+                                                Row(
+                                                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                                  children: [
+                                                    Text(
+                                                      isErr ? "Failed (Retry)" : "${(t.progress * 100).toStringAsFixed(1)}%",
+                                                      style: TextStyle(color: isErr ? Colors.red : Colors.black87, fontSize: 12),
+                                                    ),
+                                                    IconButton(
+                                                      icon: const Icon(Icons.cancel, color: Colors.grey, size: 20),
+                                                      onPressed: () {
+                                                        t.cancelToken?.cancel();
+                                                        setState(() => _activeTasks.remove(t));
+                                                      },
+                                                    )
+                                                  ],
+                                                )
                                               ],
                                             ),
                                           ),
@@ -864,20 +939,6 @@ jobs:
                     const Center(child: Text("VidMate Master Pro")),
                   ],
                 ),
-                floatingActionButton: _currentTab == 0
-                    ? FloatingActionButton(
-                        backgroundColor: const Color(0xFFFF2B42),
-                        onPressed: () async {
-                          String? u = await _webController.currentUrl();
-                          if (u != null) {
-                            if (u.contains('watch') || u.contains('youtu.be')) {
-                              _fetchYouTubeInfo(u);
-                            }
-                          }
-                        },
-                        child: const Icon(Icons.download, color: Colors.white, size: 28),
-                      )
-                    : null,
                 bottomNavigationBar: BottomNavigationBar(
                   currentIndex: _currentTab,
                   selectedItemColor: Colors.red,
