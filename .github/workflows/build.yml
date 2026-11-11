@@ -24,7 +24,7 @@ jobs:
         with:
           channel: 'stable'
 
-      - name: Create App & Inject Native In-Browser Streamer
+      - name: Create App & Inject Single Prompt Auto Downloader
         run: |
           flutter create my_downloader --org com.myvidmate.app
           cd my_downloader
@@ -52,8 +52,11 @@ jobs:
             final String id;
             final String name;
             final String subfolder;
+            final String fileUrl;
+            final String sourcePage;
             double progress;
             String status;
+            bool isPaused;
             IOSink? sink;
             File? file;
 
@@ -61,8 +64,11 @@ jobs:
               required this.id,
               required this.name,
               required this.subfolder,
+              required this.fileUrl,
+              required this.sourcePage,
               this.progress = 0.0,
               this.status = 'downloading',
+              this.isPaused = false,
               this.sink,
               this.file,
             });
@@ -80,8 +86,13 @@ jobs:
             late TabController _downloadTabController;
             late final WebViewController _webController;
             final TextEditingController _searchController = TextEditingController();
+            final FocusNode _searchFocusNode = FocusNode();
+            
             bool _isLoading = false;
             bool _isBottomSheetOpen = false;
+            bool _isDialogShowing = false;
+            bool _isCurrentUrlBookmarked = false;
+            DateTime? _lastBackPressTime;
 
             bool _isDesktopMode = false;
             static const String desktopUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
@@ -99,6 +110,10 @@ jobs:
               _loadBookmarks();
               _loadDownloadedFiles();
 
+              _searchFocusNode.addListener(() {
+                if (mounted) setState(() {});
+              });
+
               _webController = WebViewController()
                 ..setJavaScriptMode(JavaScriptMode.unrestricted)
                 ..setUserAgent(mobileUA)
@@ -112,16 +127,22 @@ jobs:
                   NavigationDelegate(
                     onPageStarted: (url) {
                       _searchController.text = url;
+                      _updateBookmarkIcon(url);
+                      if (mounted) setState(() => _isLoading = true);
                     },
                     onPageFinished: (url) {
-                      // ★ உங்கள் Grabber.kt-ல் இருந்த அதே In-Browser Streamer Script ★
+                      if (mounted) setState(() => _isLoading = false);
+                      _updateBookmarkIcon(url);
+
                       _webController.runJavaScript(r"""
                         var touchTimer = null;
                         var isBusy = false;
+                        window.__pausedTasks = window.__pausedTasks || {};
 
-                        // பாடல் தரவுகளை Browser வழியாகவே துண்டு துண்டாக (Chunks) அனுப்பும் எஞ்சின்
+                        // In-Browser Stream Chunks Engine
                         window.streamFileFromBrowser = async function(url, taskId) {
                           try {
+                            window.__pausedTasks[taskId] = false;
                             var r = await fetch(url, {credentials: 'include'});
                             if (!r.ok) {
                               VidMateBridge.postMessage(JSON.stringify({type: 'dl_fail', id: taskId, err: 'HTTP ' + r.status}));
@@ -132,6 +153,10 @@ jobs:
                             var loaded = 0;
 
                             while (true) {
+                              if (window.__pausedTasks[taskId]) {
+                                reader.cancel();
+                                return;
+                              }
                               var chunk = await reader.read();
                               if (chunk.done) break;
                               var bytes = chunk.value;
@@ -153,40 +178,65 @@ jobs:
                             }
                             VidMateBridge.postMessage(JSON.stringify({type: 'dl_done', id: taskId}));
                           } catch (e) {
-                            VidMateBridge.postMessage(JSON.stringify({type: 'dl_fail', id: taskId, err: String(e)}));
+                            if (!window.__pausedTasks[taskId]) {
+                              VidMateBridge.postMessage(JSON.stringify({type: 'dl_fail', id: taskId, err: String(e)}));
+                            }
                           }
                         };
 
-                        window.startBatchCrawl = async function(rootName, albums) {
-                          for (var i = 0; i < albums.length; i++) {
-                            var alb = albums[i];
-                            try {
-                              var res = await fetch(alb.url, {credentials: 'include'});
-                              if (!res.ok) continue;
-                              var html = await res.text();
-                              var doc = new DOMParser().parseFromString(html, 'text/html');
+                        window.pauseBrowserStream = function(taskId) {
+                          window.__pausedTasks[taskId] = true;
+                        };
 
-                              var seen = {};
-                              doc.querySelectorAll('a[href], audio, source, [data-url]').forEach(function(el) {
-                                var href = el.getAttribute('href') || el.getAttribute('src') || el.getAttribute('data-url');
-                                if (href && href.match(/\.mp3/i)) {
+                        // ★ பின்னணியில் அமைதியாக அத்தனை Subfolders-களையும் டவுன்லோட் செய்யும் எஞ்சின் (NO POPUP) ★
+                        async function crawlDeepFolderSilently(folderPath, pageUrl, depth) {
+                          if (depth > 5) return;
+                          try {
+                            var res = await fetch(pageUrl, {credentials: 'include'});
+                            if (!res.ok) return;
+                            var html = await res.text();
+                            var doc = new DOMParser().parseFromString(html, 'text/html');
+
+                            var seen = {};
+                            doc.querySelectorAll('a[href], audio, source, [data-url]').forEach(function(el) {
+                              var href = el.getAttribute('href') || el.getAttribute('src') || el.getAttribute('data-url');
+                              if (href && href.match(/\.mp3/i)) {
+                                try {
+                                  var full = new URL(href, pageUrl).href;
+                                  var sName = el.innerText.trim() || decodeURIComponent(full.split('/').pop().split('?')[0]);
+                                  if (!seen[full]) {
+                                    seen[full] = true;
+                                    VidMateBridge.postMessage(JSON.stringify({
+                                      type: 'init_download',
+                                      url: full,
+                                      subfolder: folderPath,
+                                      name: sName,
+                                      page: pageUrl
+                                    }));
+                                  }
+                                } catch(x){}
+                              }
+                            });
+
+                            doc.querySelectorAll('a[href]').forEach(function(a) {
+                              var aTxt = a.innerText.trim();
+                              var aHref = a.getAttribute('href');
+                              if (aTxt.length > 2 && aHref && !aHref.startsWith('javascript') && !aHref.includes('#') && !aTxt.endsWith('.mp3')) {
+                                if (!['Home', 'Songs', 'Bible', 'Quiz', 'Search', 'Contact', 'TV', 'Facebook', 'About'].includes(aTxt)) {
                                   try {
-                                    var full = new URL(href, alb.url).href;
-                                    var sName = el.innerText.trim() || decodeURIComponent(full.split('/').pop().split('?')[0]);
-                                    if (!seen[full]) {
-                                      seen[full] = true;
-                                      VidMateBridge.postMessage(JSON.stringify({
-                                        type: 'init_download',
-                                        url: full,
-                                        subfolder: rootName + '/' + alb.name,
-                                        name: sName
-                                      }));
+                                    var nextUrl = new URL(aHref, pageUrl).href;
+                                    if (nextUrl !== pageUrl && !nextUrl.endsWith('/')) {
+                                      crawlDeepFolderSilently(folderPath + '/' + aTxt, nextUrl, depth + 1);
                                     }
                                   } catch(x){}
                                 }
-                              });
-                            } catch(e) {}
-                          }
+                              }
+                            });
+                          } catch(e){}
+                        }
+
+                        window.startAutoCrawl = async function(rootName, rootUrl) {
+                          await crawlDeepFolderSilently(rootName, rootUrl, 0);
                         };
 
                         function isVideoLink(link) {
@@ -211,11 +261,13 @@ jobs:
                           var title = link.innerText.trim() || (img ? img.alt : '') || link.title || 'Item';
                           var href = link.href;
 
+                          // 1. YouTube
                           if (href.includes('watch') || href.includes('youtu.be')) {
                             VidMateBridge.postMessage(JSON.stringify({type: 'youtube', url: href, name: title}));
                             return;
                           }
 
+                          // 2. Video
                           if (isVideoLink(link)) {
                             fetch(href, {credentials: 'include'})
                               .then(function(r){ return r.text(); })
@@ -246,49 +298,12 @@ jobs:
                             return;
                           }
 
-                          fetch(href, {credentials: 'include'})
-                            .then(function(r){ return r.text(); })
-                            .then(function(html){
-                              var doc = new DOMParser().parseFromString(html, 'text/html');
-                              var songs = [];
-                              var seenS = {};
-
-                              doc.querySelectorAll('a[href], audio, source').forEach(function(el) {
-                                var h = el.getAttribute('href') || el.getAttribute('src');
-                                if (h && h.match(/\.mp3/i)) {
-                                  try {
-                                    var full = new URL(h, href).href;
-                                    var name = el.innerText.trim() || decodeURIComponent(full.split('/').pop().split('?')[0]);
-                                    if (!seenS[full]) {
-                                      seenS[full] = true;
-                                      songs.push({title: name, url: full});
-                                    }
-                                  } catch(x){}
-                                }
-                              });
-
-                              var subAlbums = [];
-                              var skipSelector = 'nav, header, footer, [class*="menu"], [id*="menu"], [class*="nav"], [id*="nav"]';
-                              doc.querySelectorAll('a').forEach(function(a){
-                                var txt = a.innerText.trim();
-                                if (txt.length > 1 && a.href && !a.href.startsWith('javascript') && !a.href.includes('#')) {
-                                  if (!a.closest(skipSelector)) {
-                                    if (!['Home', 'Songs', 'Bible', 'Quiz', 'Search', 'Contact', 'TV', 'Facebook', 'About'].includes(txt)) {
-                                      if (!txt.endsWith('.mp3')) subAlbums.push({name: txt, url: a.href});
-                                    }
-                                  }
-                                }
-                              });
-
-                              VidMateBridge.postMessage(JSON.stringify({
-                                type: 'folder_result',
-                                url: href,
-                                name: title,
-                                songs: songs,
-                                subAlbums: subAlbums
-                              }));
-                            })
-                            .catch(function(){});
+                          // ★ Folder மீது Long Press செய்த உடனே ஒரே ஒரு Pop-up கேட்கும் நிகழ்வை அனுப்புகிறது ★
+                          VidMateBridge.postMessage(JSON.stringify({
+                            type: 'folder_long_press',
+                            url: href,
+                            name: title
+                          }));
                         }
 
                         document.addEventListener('contextmenu', function(e) {
@@ -312,6 +327,15 @@ jobs:
                 ..loadRequest(Uri.parse('https://m.youtube.com'));
             }
 
+            void _updateBookmarkIcon(String? url) {
+              if (url == null) return;
+              if (mounted) {
+                setState(() {
+                  _isCurrentUrlBookmarked = _bookmarks.any((b) => b['url'] == url);
+                });
+              }
+            }
+
             void _handleBridgeMessage(String jsonStr) {
               try {
                 var data = jsonDecode(jsonStr);
@@ -326,16 +350,14 @@ jobs:
                   Map<String, String> qMap = rawQ.map((k, v) => MapEntry(k.toString(), v.toString()));
                   _showVideoQualityDialog(data['name'], thumb, qMap.isNotEmpty ? qMap : {'Original MP4': data['url']}, data['url']);
                 } 
-                else if (type == 'folder_result') {
-                  List<dynamic> songs = data['songs'] ?? [];
-                  List<dynamic> subAlbums = data['subAlbums'] ?? [];
-                  _showFolderDialog(data['name'], data['url'], songs, subAlbums);
+                // ★ Long Press செய்தவுடன் ஒரே ஒரு முறை மட்டும் Pop-up கேட்கும் இடம் ★
+                else if (type == 'folder_long_press') {
+                  _showSingleMasterConfirmDialog(data['name'], data['url']);
                 }
-                // Browser வழியே டவுன்லோட் தொடங்குதல்
+                // பின்னணியில் அமைதியாக டவுன்லோட் ஆவது (NO POP-UP)
                 else if (type == 'init_download') {
-                  _initBrowserDownload(data['url'], data['subfolder'], data['name']);
+                  _initBrowserDownload(data['url'], data['subfolder'], data['name'], data['page'] ?? '');
                 }
-                // Browser அனுப்பும் Base64 Chunks-ஐ ஃபைலில் எழுதுதல்
                 else if (type == 'dl_chunk') {
                   String taskId = data['id'];
                   String b64 = data['data'];
@@ -343,7 +365,7 @@ jobs:
                   int total = data['total'] ?? 0;
 
                   var task = _tasksMap[taskId];
-                  if (task != null && task.sink != null) {
+                  if (task != null && task.sink != null && !task.isPaused) {
                     Uint8List bytes = base64Decode(b64);
                     task.sink!.add(bytes);
                     if (total > 0 && mounted) {
@@ -353,7 +375,6 @@ jobs:
                     }
                   }
                 }
-                // டவுன்லோட் முழுமையாக முடிந்தது
                 else if (type == 'dl_done') {
                   String taskId = data['id'];
                   var task = _tasksMap[taskId];
@@ -369,7 +390,6 @@ jobs:
                     }
                   }
                 }
-                // தோல்வியடைந்தால்
                 else if (type == 'dl_fail') {
                   String taskId = data['id'];
                   var task = _tasksMap[taskId];
@@ -386,8 +406,59 @@ jobs:
               } catch (_) {}
             }
 
-            // In-Browser Stream File Initializer
-            Future<void> _initBrowserDownload(String fileUrl, String subfolder, String fileName) async {
+            // ★ Long Press செய்தவுடன் கேட்கும் அந்த ஒரே ஒரு Pop-up விண்டோ ★
+            void _showSingleMasterConfirmDialog(String folderName, String folderUrl) {
+              if (_isDialogShowing) return;
+              _isDialogShowing = true;
+
+              String cleanName = folderName.replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
+              if (cleanName.isEmpty) cleanName = "Songs";
+
+              showDialog(
+                context: context,
+                barrierDismissible: false,
+                builder: (ctx) => AlertDialog(
+                  title: Row(
+                    children: [
+                      const Icon(Icons.folder, color: Colors.amber, size: 28),
+                      const SizedBox(width: 8),
+                      Expanded(child: Text(cleanName, style: const TextStyle(fontWeight: FontWeight.bold))),
+                    ],
+                  ),
+                  content: Text(
+                    "'$cleanName' மற்றும் அதனுள் இருக்கும் அனைத்து Subfolders, பாடல்களையும் வெப்சைட்டில் உள்ளவாறே டவுன்லோட் செய்யவா?",
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () {
+                        _isDialogShowing = false;
+                        Navigator.pop(ctx);
+                      },
+                      child: const Text("Cancel"),
+                    ),
+                    ElevatedButton(
+                      style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                      onPressed: () {
+                        _isDialogShowing = false;
+                        Navigator.pop(ctx);
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(content: Text("'$cleanName' டவுன்லோட் தொடங்குகிறது...")),
+                        );
+
+                        // ஒரு முறை உறுதி செய்தவுடன் பின்னணியில் அமைதியாக இயங்கும் (இனி எந்த Pop-up-ம் வராது!)
+                        _webController.runJavaScript('''
+                          window.startAutoCrawl(${jsonEncode(cleanName)}, ${jsonEncode(folderUrl)});
+                        ''');
+                        setState(() => _currentTab = 2); // Downloads பக்கத்திற்குச் செல்லும்
+                      },
+                      child: const Text("Download All", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                    )
+                  ],
+                ),
+              ).then((_) => _isDialogShowing = false);
+            }
+
+            Future<void> _initBrowserDownload(String fileUrl, String subfolder, String fileName, String sourcePage) async {
               String taskId = DateTime.now().millisecondsSinceEpoch.toString() + fileUrl.hashCode.toString();
               String name = fileName.replaceAll(RegExp(r'[^\w\s\.\-]+'), '').trim();
               if (!name.toLowerCase().endsWith('.mp3') && !name.toLowerCase().endsWith('.mp4')) {
@@ -412,20 +483,35 @@ jobs:
                   id: taskId,
                   name: name,
                   subfolder: subfolder,
+                  fileUrl: fileUrl,
+                  sourcePage: sourcePage.isNotEmpty ? sourcePage : fileUrl,
                   sink: sink,
                   file: f,
                 );
 
-                setState(() {
-                  _tasksMap[taskId] = task;
-                });
+                if (mounted) {
+                  setState(() {
+                    _tasksMap[taskId] = task;
+                  });
+                }
 
-                // Browser-க்குள் fetch Stream தொடங்க ஆணையிடுகிறோம்!
                 _webController.runJavaScript('''
                   window.streamFileFromBrowser(${jsonEncode(fileUrl)}, ${jsonEncode(taskId)});
                 ''');
-              } catch (e) {
-                print("Init error: $e");
+              } catch (_) {}
+            }
+
+            void _togglePause(DownloadTask task) {
+              setState(() {
+                task.isPaused = !task.isPaused;
+              });
+
+              if (task.isPaused) {
+                _webController.runJavaScript('window.pauseBrowserStream(${jsonEncode(task.id)});');
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("${task.name} Paused")));
+              } else {
+                _webController.runJavaScript('window.streamFileFromBrowser(${jsonEncode(task.fileUrl)}, ${jsonEncode(task.id)});');
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("${task.name} Resumed")));
               }
             }
 
@@ -496,7 +582,7 @@ jobs:
                                   String streamUrl = qualities[selectedFormat]!;
                                   String cleanTitle = title.replaceAll(RegExp(r'[^\w\s]+'), '').trim();
                                   if (cleanTitle.isEmpty) cleanTitle = "Video";
-                                  _initBrowserDownload(streamUrl, "Videos", "$cleanTitle-$selectedFormat.mp4");
+                                  _initBrowserDownload(streamUrl, "Videos", "$cleanTitle-$selectedFormat.mp4", referer);
                                   setState(() {
                                     _downloadedQualities[selectedFormat] = true;
                                     _currentTab = 2;
@@ -513,95 +599,19 @@ jobs:
               );
             }
 
-            void _showFolderDialog(String folderName, String folderUrl, List<dynamic> songs, List<dynamic> subAlbums) {
-              String cleanName = folderName.replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
-              if (cleanName.isEmpty) cleanName = "Album";
-
-              if (songs.isNotEmpty) {
-                showDialog(
-                  context: context,
-                  builder: (ctx) => AlertDialog(
-                    title: Row(
-                      children: [
-                        const Icon(Icons.folder, color: Colors.amber, size: 28),
-                        const SizedBox(width: 8),
-                        Expanded(child: Text(cleanName, style: const TextStyle(fontWeight: FontWeight.bold))),
-                      ],
-                    ),
-                    content: Text("இந்த ஆல்பத்தில் ${songs.length} பாடல்கள் கண்டறியப்பட்டுள்ளன!\n\nஅனைத்தையும் 'Download/$cleanName/' ஃபோல்டரில் டவுன்லோட் செய்யவா?"),
-                    actions: [
-                      TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
-                      ElevatedButton(
-                        style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-                        onPressed: () {
-                          Navigator.pop(ctx);
-                          for (var s in songs) {
-                            String sUrl = s['url'].toString();
-                            String sTitle = s['title'].toString();
-                            _initBrowserDownload(sUrl, cleanName, sTitle);
-                          }
-                          setState(() => _currentTab = 2);
-                        },
-                        child: Text("Download All (${songs.length})", style: const TextStyle(color: Colors.white)),
-                      )
-                    ],
-                  ),
-                );
-              } 
-              else if (subAlbums.isNotEmpty) {
-                showDialog(
-                  context: context,
-                  builder: (ctx) => AlertDialog(
-                    title: Row(
-                      children: [
-                        const Icon(Icons.folder_special, color: Colors.blue, size: 28),
-                        const SizedBox(width: 8),
-                        Expanded(child: Text(cleanName, style: const TextStyle(fontWeight: FontWeight.bold))),
-                      ],
-                    ),
-                    content: Text(
-                      "இதில் ${subAlbums.length} Albums உள்ளன (Aalayamani, Amaithikaaga...).\n\n"
-                      "அனைத்து Albums-களையும் 'Download/$cleanName/' ஃபோல்டருக்குள் Subfolders அமைப்பில் டவுன்லோட் செய்யவா?",
-                    ),
-                    actions: [
-                      TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
-                      ElevatedButton(
-                        style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-                        onPressed: () {
-                          Navigator.pop(ctx);
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(content: Text("'$cleanName': ${subAlbums.length} Albums டவுன்லோட் துவங்குகிறது...")),
-                          );
-                          String albumsJson = jsonEncode(subAlbums);
-                          _webController.runJavaScript('''
-                            window.startBatchCrawl(${jsonEncode(cleanName)}, $albumsJson);
-                          ''');
-                          setState(() => _currentTab = 2);
-                        },
-                        child: Text("Download All (${subAlbums.length} Albums)", style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-                      )
-                    ],
-                  ),
-                );
-              }
-            }
-
             void _fetchYouTubeInfo(String url) async {
               if (_isBottomSheetOpen || _isLoading) return;
               _isBottomSheetOpen = true;
-              _isLoading = true;
-              setState(() {});
+              if (mounted) setState(() => _isLoading = true);
 
               var yt = YoutubeExplode();
               try {
                 var video = await yt.videos.get(url);
                 var manifest = await yt.videos.streamsClient.getManifest(video.id);
-                _isLoading = false;
-                setState(() {});
+                if (mounted) setState(() => _isLoading = false);
                 await _showYouTubeQualityDialog(video, manifest);
               } catch (_) {
-                _isLoading = false;
-                setState(() {});
+                if (mounted) setState(() => _isLoading = false);
               } finally {
                 yt.close();
                 _isBottomSheetOpen = false;
@@ -718,6 +728,8 @@ jobs:
                 id: taskId,
                 name: fileName,
                 subfolder: "YouTube",
+                fileUrl: video.url,
+                sourcePage: video.url,
                 sink: fileStream,
                 file: file,
               );
@@ -764,10 +776,12 @@ jobs:
               setState(() {
                 if (exists) {
                   _bookmarks.removeWhere((b) => b['url'] == currentUrl);
-                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Bookmark Removed! ❌")));
+                  _isCurrentUrlBookmarked = false;
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Bookmark நீக்கப்பட்டது! ❌")));
                 } else {
                   _bookmarks.add({'title': title ?? 'Page', 'url': currentUrl});
-                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Bookmarked! ⭐")));
+                  _isCurrentUrlBookmarked = true;
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Bookmark சேமிக்கப்பட்டது! ⭐")));
                 }
               });
               await prefs.setString('saved_bookmarks', jsonEncode(_bookmarks));
@@ -788,189 +802,278 @@ jobs:
               } catch (_) {}
             }
 
+            void _handleGoOrReload() {
+              if (_searchFocusNode.hasFocus) {
+                _searchFocusNode.unfocus();
+                String target = _searchController.text.trim();
+                if (!target.startsWith('http')) target = 'https://m.youtube.com/results?search_query=${Uri.encodeComponent(target)}';
+                _webController.loadRequest(Uri.parse(target));
+              } else if (_isLoading) {
+                _webController.runJavaScript('window.stop();');
+                setState(() => _isLoading = false);
+              } else {
+                _webController.reload();
+              }
+            }
+
+            Future<bool> _handleWillPop() async {
+              if (_currentTab != 0) {
+                setState(() => _currentTab = 0);
+                return false;
+              }
+              if (await _webController.canGoBack()) {
+                await _webController.goBack();
+                return false;
+              }
+
+              DateTime now = DateTime.now();
+              if (_lastBackPressTime == null || now.difference(_lastBackPressTime!) > const Duration(seconds: 2)) {
+                _lastBackPressTime = now;
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text("வெளியேற மீண்டும் Back பட்டனை அழுத்தவும்"),
+                    duration: Duration(seconds: 2),
+                  ),
+                );
+                return false;
+              }
+              return true;
+            }
+
             @override
             Widget build(BuildContext context) {
               var tasksList = _tasksMap.values.toList();
 
-              return Scaffold(
-                appBar: AppBar(
-                  backgroundColor: Colors.white,
-                  elevation: 1,
-                  title: Container(
-                    height: 38,
-                    decoration: BoxDecoration(color: Colors.grey[200], borderRadius: BorderRadius.circular(20)),
-                    child: TextField(
-                      controller: _searchController,
-                      style: const TextStyle(fontSize: 14),
-                      decoration: const InputDecoration(
-                        hintText: "Search or enter URL...",
-                        prefixIcon: Icon(Icons.search, size: 18, color: Colors.grey),
-                        border: InputBorder.none,
-                        contentPadding: EdgeInsets.only(top: 8),
+              return WillPopScope(
+                onWillPop: _handleWillPop,
+                child: Scaffold(
+                  appBar: AppBar(
+                    backgroundColor: Colors.white,
+                    elevation: 1,
+                    title: Container(
+                      height: 38,
+                      decoration: BoxDecoration(color: Colors.grey[200], borderRadius: BorderRadius.circular(20)),
+                      child: TextField(
+                        controller: _searchController,
+                        focusNode: _searchFocusNode,
+                        style: const TextStyle(fontSize: 14),
+                        decoration: InputDecoration(
+                          hintText: "Search or enter URL...",
+                          prefixIcon: const Icon(Icons.search, size: 18, color: Colors.grey),
+                          suffixIcon: IconButton(
+                            icon: Icon(
+                              _searchFocusNode.hasFocus
+                                  ? Icons.arrow_forward
+                                  : (_isLoading ? Icons.close : Icons.refresh),
+                              size: 18,
+                              color: _searchFocusNode.hasFocus ? Colors.red : Colors.grey[700],
+                            ),
+                            onPressed: _handleGoOrReload,
+                          ),
+                          border: InputBorder.none,
+                          contentPadding: const EdgeInsets.only(top: 8),
+                        ),
+                        onSubmitted: (url) {
+                          _searchFocusNode.unfocus();
+                          String target = url.trim();
+                          if (!target.startsWith('http')) target = 'https://m.youtube.com/results?search_query=${Uri.encodeComponent(target)}';
+                          _webController.loadRequest(Uri.parse(target));
+                        },
                       ),
-                      onSubmitted: (url) {
-                        String target = url.trim();
-                        if (!target.startsWith('http')) target = 'https://m.youtube.com/results?search_query=${Uri.encodeComponent(target)}';
-                        _webController.loadRequest(Uri.parse(target));
-                      },
                     ),
+                    actions: [
+                      IconButton(
+                        icon: Icon(Icons.desktop_windows, size: 21, color: _isDesktopMode ? Colors.blue : Colors.black87),
+                        tooltip: "Desktop Mode",
+                        onPressed: () async {
+                          setState(() => _isDesktopMode = !_isDesktopMode);
+                          await _webController.setUserAgent(_isDesktopMode ? desktopUA : mobileUA);
+                          await _webController.reload();
+                        },
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.add_box_outlined, size: 21, color: Colors.black87),
+                        tooltip: "New Tab",
+                        onPressed: () {
+                          _searchController.clear();
+                          _webController.loadRequest(Uri.parse('https://www.google.com'));
+                          setState(() => _currentTab = 0);
+                        },
+                      ),
+                      IconButton(
+                        icon: Icon(
+                          _isCurrentUrlBookmarked ? Icons.star : Icons.star_border,
+                          size: 22,
+                          color: _isCurrentUrlBookmarked ? Colors.amber : Colors.grey,
+                        ),
+                        tooltip: "Bookmark",
+                        onPressed: _toggleBookmark,
+                      ),
+                      const SizedBox(width: 4),
+                    ],
                   ),
-                  actions: [
-                    IconButton(
-                      icon: Icon(Icons.desktop_windows, size: 21, color: _isDesktopMode ? Colors.blue : Colors.black87),
-                      tooltip: "Desktop Mode",
-                      onPressed: () async {
-                        setState(() => _isDesktopMode = !_isDesktopMode);
-                        await _webController.setUserAgent(_isDesktopMode ? desktopUA : mobileUA);
-                        await _webController.reload();
-                      },
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.add_box_outlined, size: 21, color: Colors.black87),
-                      tooltip: "New Tab",
-                      onPressed: () {
-                        _searchController.clear();
-                        _webController.loadRequest(Uri.parse('https://www.google.com'));
-                        setState(() => _currentTab = 0);
-                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("New Page Opened! 🌐")));
-                      },
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.star_border, size: 22, color: Colors.amber),
-                      tooltip: "Bookmark",
-                      onPressed: _toggleBookmark,
-                    ),
-                    const SizedBox(width: 4),
-                  ],
-                ),
-                body: IndexedStack(
-                  index: _currentTab,
-                  children: [
-                    Stack(
-                      children: [
-                        WebViewWidget(controller: _webController),
-                        if (_isLoading) const Center(child: CircularProgressIndicator(color: Colors.red)),
-                      ],
-                    ),
-                    _bookmarks.isEmpty
-                        ? const Center(child: Text("Bookmark எதுவும் இல்லை! ⭐"))
-                        : ListView.builder(
-                            itemCount: _bookmarks.length,
-                            itemBuilder: (ctx, i) => ListTile(
-                              leading: const Icon(Icons.bookmark, color: Colors.amber),
-                              title: Text(_bookmarks[i]['title'] ?? '', maxLines: 1),
-                              onTap: () {
-                                _webController.loadRequest(Uri.parse(_bookmarks[i]['url']!));
-                                setState(() => _currentTab = 0);
-                              },
+                  body: IndexedStack(
+                    index: _currentTab,
+                    children: [
+                      Stack(
+                        children: [
+                          WebViewWidget(controller: _webController),
+                          if (_isLoading) const Center(child: CircularProgressIndicator(color: Colors.red)),
+                        ],
+                      ),
+                      _bookmarks.isEmpty
+                          ? const Center(child: Text("Bookmark எதுவும் இல்லை! ⭐"))
+                          : ListView.builder(
+                              itemCount: _bookmarks.length,
+                              itemBuilder: (ctx, i) => ListTile(
+                                leading: const Icon(Icons.bookmark, color: Colors.amber),
+                                title: Text(_bookmarks[i]['title'] ?? '', maxLines: 1),
+                                onTap: () {
+                                  _webController.loadRequest(Uri.parse(_bookmarks[i]['url']!));
+                                  setState(() => _currentTab = 0);
+                                },
+                              ),
+                            ),
+                      Column(
+                        children: [
+                          Container(
+                            color: Colors.white,
+                            child: TabBar(
+                              controller: _downloadTabController,
+                              labelColor: Colors.red,
+                              unselectedLabelColor: Colors.grey,
+                              indicatorColor: Colors.red,
+                              tabs: [
+                                Tab(text: "Downloading (${tasksList.length})"),
+                                Tab(text: "Downloaded (${_downloadedFiles.length})"),
+                              ],
                             ),
                           ),
-                    Column(
-                      children: [
-                        Container(
-                          color: Colors.white,
-                          child: TabBar(
-                            controller: _downloadTabController,
-                            labelColor: Colors.red,
-                            unselectedLabelColor: Colors.grey,
-                            indicatorColor: Colors.red,
-                            tabs: [
-                              Tab(text: "Downloading (${tasksList.length})"),
-                              Tab(text: "Downloaded (${_downloadedFiles.length})"),
-                            ],
-                          ),
-                        ),
-                        Expanded(
-                          child: TabBarView(
-                            controller: _downloadTabController,
-                            children: [
-                              tasksList.isEmpty
-                                  ? const Center(child: Text("டவுன்லோட் எதுவும் இல்லை!"))
-                                  : ListView.builder(
-                                      itemCount: tasksList.length,
-                                      itemBuilder: (ctx, i) {
-                                        var t = tasksList[i];
-                                        return Card(
-                                          margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                                          child: Padding(
-                                            padding: const EdgeInsets.all(12),
-                                            child: Column(
-                                              crossAxisAlignment: CrossAxisAlignment.start,
-                                              children: [
-                                                Text(t.name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.bold)),
-                                                const SizedBox(height: 4),
-                                                Text("📁 Folder: ${t.subfolder}", style: const TextStyle(fontSize: 12, color: Colors.blue)),
-                                                const SizedBox(height: 8),
-                                                LinearProgressIndicator(
-                                                  value: t.progress > 0 ? t.progress : null,
-                                                  color: Colors.red,
-                                                  backgroundColor: Colors.grey[200],
-                                                ),
-                                                const SizedBox(height: 6),
-                                                Row(
-                                                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                                  children: [
-                                                    Text("${(t.progress * 100).toStringAsFixed(1)}%", style: const TextStyle(fontSize: 12)),
-                                                    Text(t.status, style: const TextStyle(fontSize: 11, color: Colors.grey)),
-                                                  ],
-                                                )
-                                              ],
+                          Expanded(
+                            child: TabBarView(
+                              controller: _downloadTabController,
+                              children: [
+                                tasksList.isEmpty
+                                    ? const Center(child: Text("டவுன்லோட் எதுவும் இல்லை!"))
+                                    : ListView.builder(
+                                        itemCount: tasksList.length,
+                                        itemBuilder: (ctx, i) {
+                                          var t = tasksList[i];
+                                          return Card(
+                                            margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                            child: Padding(
+                                              padding: const EdgeInsets.all(12),
+                                              child: Column(
+                                                crossAxisAlignment: CrossAxisAlignment.start,
+                                                children: [
+                                                  Text(t.name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.bold)),
+                                                  const SizedBox(height: 4),
+                                                  Text("📁 Folder: ${t.subfolder}", style: const TextStyle(fontSize: 12, color: Colors.blue)),
+                                                  const SizedBox(height: 8),
+                                                  LinearProgressIndicator(
+                                                    value: t.progress > 0 ? t.progress : null,
+                                                    color: t.isPaused ? Colors.orange : Colors.red,
+                                                    backgroundColor: Colors.grey[200],
+                                                  ),
+                                                  const SizedBox(height: 6),
+                                                  Row(
+                                                    children: [
+                                                      Text(
+                                                        t.isPaused ? "Paused" : "${(t.progress * 100).toStringAsFixed(1)}%",
+                                                        style: TextStyle(
+                                                          fontSize: 12,
+                                                          color: t.isPaused ? Colors.orange : Colors.black87,
+                                                          fontWeight: FontWeight.bold,
+                                                        ),
+                                                      ),
+                                                      const Spacer(),
+                                                      IconButton(
+                                                        icon: const Icon(Icons.open_in_browser, size: 20, color: Colors.blue),
+                                                        tooltip: "Go to Source Page",
+                                                        onPressed: () {
+                                                          if (t.sourcePage.isNotEmpty) {
+                                                            _webController.loadRequest(Uri.parse(t.sourcePage));
+                                                            setState(() => _currentTab = 0);
+                                                          }
+                                                        },
+                                                      ),
+                                                      IconButton(
+                                                        icon: Icon(
+                                                          t.isPaused ? Icons.play_arrow : Icons.pause,
+                                                          size: 20,
+                                                          color: t.isPaused ? Colors.green : Colors.orange,
+                                                        ),
+                                                        tooltip: t.isPaused ? "Resume" : "Pause",
+                                                        onPressed: () => _togglePause(t),
+                                                      ),
+                                                      IconButton(
+                                                        icon: const Icon(Icons.close, size: 20, color: Colors.grey),
+                                                        onPressed: () {
+                                                          t.sink?.close();
+                                                          t.file?.delete();
+                                                          setState(() => _tasksMap.remove(t.id));
+                                                        },
+                                                      ),
+                                                    ],
+                                                  )
+                                                ],
+                                              ),
                                             ),
-                                          ),
-                                        );
-                                      },
-                                    ),
-                              _downloadedFiles.isEmpty
-                                  ? const Center(child: Text("கோப்புகள் இல்லை!"))
-                                  : ListView.builder(
-                                      itemCount: _downloadedFiles.length,
-                                      itemBuilder: (ctx, i) {
-                                        var f = _downloadedFiles[i];
-                                        return ListTile(
-                                          leading: const Icon(Icons.music_video, color: Colors.red),
-                                          title: Text(f.path.split('/').last, maxLines: 1),
-                                          subtitle: Text(f.path.replaceFirst('/storage/emulated/0/Download/', '')),
-                                          trailing: IconButton(
-                                            icon: const Icon(Icons.delete, color: Colors.grey),
-                                            onPressed: () {
-                                              f.deleteSync();
-                                              _loadDownloadedFiles();
-                                            },
-                                          ),
-                                        );
-                                      },
-                                    ),
-                            ],
-                          ),
-                        )
-                      ],
-                    ),
-                    const Center(child: Text("VidMate Master Pro")),
-                  ],
-                ),
-                bottomNavigationBar: BottomNavigationBar(
-                  currentIndex: _currentTab,
-                  selectedItemColor: Colors.red,
-                  unselectedItemColor: Colors.grey,
-                  type: BottomNavigationBarType.fixed,
-                  onTap: (index) {
-                    if (index == 2) _loadDownloadedFiles();
-                    setState(() => _currentTab = index);
-                  },
-                  items: const [
-                    BottomNavigationBarItem(icon: Icon(Icons.home), label: "Home"),
-                    BottomNavigationBarItem(icon: Icon(Icons.bookmark), label: "Bookmarks"),
-                    BottomNavigationBarItem(icon: Icon(Icons.download), label: "Downloads"),
-                    BottomNavigationBarItem(icon: Icon(Icons.settings), label: "Settings"),
-                  ],
+                                          );
+                                        },
+                                      ),
+                                _downloadedFiles.isEmpty
+                                    ? const Center(child: Text("கோப்புகள் இல்லை!"))
+                                    : ListView.builder(
+                                        itemCount: _downloadedFiles.length,
+                                        itemBuilder: (ctx, i) {
+                                          var f = _downloadedFiles[i];
+                                          return ListTile(
+                                            leading: const Icon(Icons.music_video, color: Colors.red),
+                                            title: Text(f.path.split('/').last, maxLines: 1),
+                                            subtitle: Text(f.path.replaceFirst('/storage/emulated/0/Download/', '')),
+                                            trailing: IconButton(
+                                              icon: const Icon(Icons.delete, color: Colors.grey),
+                                              onPressed: () {
+                                                f.deleteSync();
+                                                _loadDownloadedFiles();
+                                              },
+                                            ),
+                                          );
+                                        },
+                                      ),
+                              ],
+                            ),
+                          )
+                        ],
+                      ),
+                      const Center(child: Text("VidMate Master Pro")),
+                    ],
+                  ),
+                  bottomNavigationBar: BottomNavigationBar(
+                    currentIndex: _currentTab,
+                    selectedItemColor: Colors.red,
+                    unselectedItemColor: Colors.grey,
+                    type: BottomNavigationBarType.fixed,
+                    onTap: (index) {
+                      if (index == 2) _loadDownloadedFiles();
+                      setState(() => _currentTab = index);
+                    },
+                    items: const [
+                      BottomNavigationBarItem(icon: Icon(Icons.home), label: "Home"),
+                      BottomNavigationBarItem(icon: Icon(Icons.bookmark), label: "Bookmarks"),
+                      BottomNavigationBarItem(icon: Icon(Icons.download), label: "Downloads"),
+                      BottomNavigationBarItem(icon: Icon(Icons.settings), label: "Settings"),
+                    ],
+                  ),
                 ),
               );
             }
           }
           EOF
 
-          # Cleartext HTTP மற்றும் Permissions
-          sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>' android/app/src/main/AndroidManifest.xml
+          # Permissions
+          sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.CAMERA"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>' android/app/src/main/AndroidManifest.xml
           sed -i 's/<application/<application android:usesCleartextTraffic="true" android:requestLegacyExternalStorage="true"/' android/app/src/main/AndroidManifest.xml
 
       - name: Build Release APK
