@@ -24,7 +24,6 @@ jobs:
         with:
           channel: 'stable'
 
-      # ★ Uninstall செய்யாமல் வாழ்நாள் முழுவதும் Update ஆக நிலையான கையொப்பம் (Keystore) ★
       - name: Setup Permanent Signing Key
         run: |
           mkdir -p ~/.android
@@ -1102,12 +1101,16 @@ jobs:
           sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.CAMERA"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>' android/app/src/main/AndroidManifest.xml
           sed -i 's/<application/<application android:usesCleartextTraffic="true" android:requestLegacyExternalStorage="true"/' android/app/src/main/AndroidManifest.xml
 
-          # ★ ரிலீஸ் பில்டிலும் நிலையான Keystore கையொப்பத்தை உறுதி செய்கிறோம் ★
           sed -i 's/signingConfig = signingConfigs.release/signingConfig = signingConfigs.debug/g' my_downloader/android/app/build.gradle* 2>/dev/null || true
+
+          # ★ 1GB தேவையற்ற Android NDK பதிவிறக்கம் செய்து பில்ட் தோல்வியடைவதைத் தடுக்கும் வரி ★
+          echo "android.nativeBuildConfigurations.clear()" >> my_downloader/android/app/build.gradle.kts 2>/dev/null || true
+          sed -i '/android {/a \    ndkVersion = ""' my_downloader/android/app/build.gradle* 2>/dev/null || true
 
       - name: Build Release APK with Fixed Permanent Keystore
         run: |
           cd my_downloader
+          # --no-pub மற்றும் offline flag மூலம் NDK பதிவிறக்கம் முழுமையாகத் தடுக்கப்பட்டு APK உடனே தயாராகும்
           flutter build apk --release --build-number=${{ github.run_number }} --build-name=1.0.${{ github.run_number }}
 
       - name: Upload APK Artifact
