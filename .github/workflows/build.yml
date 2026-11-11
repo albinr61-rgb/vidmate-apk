@@ -24,7 +24,7 @@ jobs:
         with:
           channel: 'stable'
 
-      - name: Create App & Inject Single Prompt Auto Downloader
+      - name: Create App & Inject Strict Hierarchy Downloader
         run: |
           flutter create my_downloader --org com.myvidmate.app
           cd my_downloader
@@ -139,7 +139,35 @@ jobs:
                         var isBusy = false;
                         window.__pausedTasks = window.__pausedTasks || {};
 
-                        // In-Browser Stream Chunks Engine
+                        // ★ Sidebar மற்றும் பொதுவான மெனுக்களை முற்றிலுமாகத் தவிர்க்கும் வடிகட்டி ★
+                        var skipNavSelector = 'aside, nav, header, footer, [class*="sidebar"], [id*="sidebar"], [class*="category"], [class*="categories"], [id*="category"], [id*="categories"], .left_column, #left_column, .left-col, #left-col, [class*="menu"], [id*="menu"]';
+
+                        // உண்மை துணை-ஃபோல்டர் (Subfolder) தானா என ஆராயும் முறை
+                        function isActualSubfolder(parentUrl, childUrl) {
+                          try {
+                            var p = new URL(parentUrl), c = new URL(childUrl);
+                            if (p.hostname.replace(/^www\./,'') !== c.hostname.replace(/^www\./,'')) return false;
+
+                            // ?folder= அல்லது ?album= வழியே இருந்தால்
+                            var keys = ['album', 'folder', 'dir', 'cat', 'category', 'id'];
+                            for (var i = 0; i < keys.length; i++) {
+                              var k = keys[i];
+                              var pv = p.searchParams.get(k);
+                              var cv = c.searchParams.get(k);
+                              if (pv !== null && cv !== null) {
+                                return cv.startsWith(pv.replace(/\/+$/, '') + '/') && cv !== pv;
+                              }
+                            }
+
+                            // Path வழியே இருந்தால் (/songs/Deva_Hits/CD1)
+                            var pDir = p.pathname.replace(/\/+$/, '') + '/';
+                            if (c.pathname.startsWith(pDir) && c.pathname !== pDir) {
+                              return true;
+                            }
+                            return false;
+                          } catch(e) { return false; }
+                        }
+
                         window.streamFileFromBrowser = async function(url, taskId) {
                           try {
                             window.__pausedTasks[taskId] = false;
@@ -188,9 +216,9 @@ jobs:
                           window.__pausedTasks[taskId] = true;
                         };
 
-                        // ★ பின்னணியில் அமைதியாக அத்தனை Subfolders-களையும் டவுன்லோட் செய்யும் எஞ்சின் (NO POPUP) ★
+                        // Sidebar-ஐ முற்றிலும் தவிர்த்து, தேர்ந்தெடுத்த ஆல்பத்தின் பாடல்களை மட்டுமே எடுக்கும் எஞ்சின்
                         async function crawlDeepFolderSilently(folderPath, pageUrl, depth) {
-                          if (depth > 5) return;
+                          if (depth > 4) return;
                           try {
                             var res = await fetch(pageUrl, {credentials: 'include'});
                             if (!res.ok) return;
@@ -198,7 +226,11 @@ jobs:
                             var doc = new DOMParser().parseFromString(html, 'text/html');
 
                             var seen = {};
+                            // 1. இந்த ஆல்பத்தில் உள்ள பாடல்களை மட்டும் எடுத்தல்
                             doc.querySelectorAll('a[href], audio, source, [data-url]').forEach(function(el) {
+                              // Sidebar-ல் இருக்கும் இணைப்புகளைத் தவிர்த்தல்
+                              if (el.closest(skipNavSelector)) return;
+
                               var href = el.getAttribute('href') || el.getAttribute('src') || el.getAttribute('data-url');
                               if (href && href.match(/\.mp3/i)) {
                                 try {
@@ -218,18 +250,20 @@ jobs:
                               }
                             });
 
+                            // 2. உள்ளே இருக்கும் நேரடி Subfolder (எ.கா: CD 1) என்றால் மட்டுமே உள்ளே செல்லும்
                             doc.querySelectorAll('a[href]').forEach(function(a) {
+                              if (a.closest(skipNavSelector)) return;
+
                               var aTxt = a.innerText.trim();
                               var aHref = a.getAttribute('href');
-                              if (aTxt.length > 2 && aHref && !aHref.startsWith('javascript') && !aHref.includes('#') && !aTxt.endsWith('.mp3')) {
-                                if (!['Home', 'Songs', 'Bible', 'Quiz', 'Search', 'Contact', 'TV', 'Facebook', 'About'].includes(aTxt)) {
-                                  try {
-                                    var nextUrl = new URL(aHref, pageUrl).href;
-                                    if (nextUrl !== pageUrl && !nextUrl.endsWith('/')) {
-                                      crawlDeepFolderSilently(folderPath + '/' + aTxt, nextUrl, depth + 1);
-                                    }
-                                  } catch(x){}
-                                }
+                              if (aTxt.length > 1 && aHref && !aHref.startsWith('javascript') && !aHref.includes('#') && !aTxt.endsWith('.mp3')) {
+                                try {
+                                  var nextUrl = new URL(aHref, pageUrl).href;
+                                  // Sidebar லிங்க் அல்லாமல், இதன் உண்மையான Subfolder என்றால் மட்டுமே செல்லும்
+                                  if (isActualSubfolder(pageUrl, nextUrl)) {
+                                    crawlDeepFolderSilently(folderPath + '/' + aTxt, nextUrl, depth + 1);
+                                  }
+                                } catch(x){}
                               }
                             });
                           } catch(e){}
@@ -253,6 +287,10 @@ jobs:
 
                         function processLink(link, ev) {
                           if (isBusy || !link || !link.href) return;
+
+                          // பயனர் Long Press செய்தது Sidebar / Categories மெனு என்றால் அதை எடுக்காது!
+                          if (link.closest(skipNavSelector)) return;
+
                           isBusy = true;
                           setTimeout(function() { isBusy = false; }, 1800);
 
@@ -267,7 +305,7 @@ jobs:
                             return;
                           }
 
-                          // 2. Video
+                          // 2. Video Qualities
                           if (isVideoLink(link)) {
                             fetch(href, {credentials: 'include'})
                               .then(function(r){ return r.text(); })
@@ -298,7 +336,7 @@ jobs:
                             return;
                           }
 
-                          // ★ Folder மீது Long Press செய்த உடனே ஒரே ஒரு Pop-up கேட்கும் நிகழ்வை அனுப்புகிறது ★
+                          // 3. நீங்கள் தேர்வு செய்த ஆல்பத்திற்கு மட்டும் Pop-up கேட்கும்
                           VidMateBridge.postMessage(JSON.stringify({
                             type: 'folder_long_press',
                             url: href,
@@ -350,11 +388,9 @@ jobs:
                   Map<String, String> qMap = rawQ.map((k, v) => MapEntry(k.toString(), v.toString()));
                   _showVideoQualityDialog(data['name'], thumb, qMap.isNotEmpty ? qMap : {'Original MP4': data['url']}, data['url']);
                 } 
-                // ★ Long Press செய்தவுடன் ஒரே ஒரு முறை மட்டும் Pop-up கேட்கும் இடம் ★
                 else if (type == 'folder_long_press') {
                   _showSingleMasterConfirmDialog(data['name'], data['url']);
                 }
-                // பின்னணியில் அமைதியாக டவுன்லோட் ஆவது (NO POP-UP)
                 else if (type == 'init_download') {
                   _initBrowserDownload(data['url'], data['subfolder'], data['name'], data['page'] ?? '');
                 }
@@ -406,7 +442,6 @@ jobs:
               } catch (_) {}
             }
 
-            // ★ Long Press செய்தவுடன் கேட்கும் அந்த ஒரே ஒரு Pop-up விண்டோ ★
             void _showSingleMasterConfirmDialog(String folderName, String folderUrl) {
               if (_isDialogShowing) return;
               _isDialogShowing = true;
@@ -426,7 +461,7 @@ jobs:
                     ],
                   ),
                   content: Text(
-                    "'$cleanName' மற்றும் அதனுள் இருக்கும் அனைத்து Subfolders, பாடல்களையும் வெப்சைட்டில் உள்ளவாறே டவுன்லோட் செய்யவா?",
+                    "'$cleanName' ஆல்பத்தில் உள்ள பாடல்களை மட்டும் Download/$cleanName/ ஃபோல்டரில் டவுன்லோட் செய்யவா?",
                   ),
                   actions: [
                     TextButton(
@@ -445,13 +480,13 @@ jobs:
                           SnackBar(content: Text("'$cleanName' டவுன்லோட் தொடங்குகிறது...")),
                         );
 
-                        // ஒரு முறை உறுதி செய்தவுடன் பின்னணியில் அமைதியாக இயங்கும் (இனி எந்த Pop-up-ம் வராது!)
+                        // Sidebar தவிர்த்து இந்த ஆல்பத்தின் பாடல்களை மட்டுமே டவுன்லோட் செய்கிறது
                         _webController.runJavaScript('''
                           window.startAutoCrawl(${jsonEncode(cleanName)}, ${jsonEncode(folderUrl)});
                         ''');
-                        setState(() => _currentTab = 2); // Downloads பக்கத்திற்குச் செல்லும்
+                        setState(() => _currentTab = 2);
                       },
-                      child: const Text("Download All", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                      child: const Text("Download", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
                     )
                   ],
                 ),
