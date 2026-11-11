@@ -24,7 +24,7 @@ jobs:
         with:
           channel: 'stable'
 
-      - name: Create App & Inject Robust Album Downloader
+      - name: Create App & Inject Native In-Browser Streamer
         run: |
           flutter create my_downloader --org com.myvidmate.app
           cd my_downloader
@@ -34,11 +34,11 @@ jobs:
           cat << 'EOF' > lib/main.dart
           import 'dart:convert';
           import 'dart:io';
+          import 'dart:typed_data';
           import 'package:flutter/material.dart';
           import 'package:webview_flutter/webview_flutter.dart';
           import 'package:youtube_explode_dart/youtube_explode_dart.dart';
           import 'package:path_provider/path_provider.dart';
-          import 'package:dio/dio.dart';
           import 'package:shared_preferences/shared_preferences.dart';
 
           void main() {
@@ -54,8 +54,8 @@ jobs:
             final String subfolder;
             double progress;
             String status;
-            String errorMsg;
-            CancelToken? cancelToken;
+            IOSink? sink;
+            File? file;
 
             DownloadTask({
               required this.id,
@@ -63,8 +63,8 @@ jobs:
               required this.subfolder,
               this.progress = 0.0,
               this.status = 'downloading',
-              this.errorMsg = '',
-              this.cancelToken,
+              this.sink,
+              this.file,
             });
           }
 
@@ -87,23 +87,10 @@ jobs:
             static const String desktopUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
             static const String mobileUA = "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36";
 
-            List<DownloadTask> _activeTasks = [];
+            final Map<String, DownloadTask> _tasksMap = {};
             List<Map<String, String>> _bookmarks = [];
             Map<String, bool> _downloadedQualities = {};
             List<FileSystemEntity> _downloadedFiles = [];
-
-            Dio _getSafeDio(String refererUrl) {
-              return Dio(BaseOptions(
-                headers: {
-                  'User-Agent': _isDesktopMode ? desktopUA : mobileUA,
-                  'Accept': '*/*',
-                  'Referer': refererUrl,
-                },
-                followRedirects: true,
-                connectTimeout: const Duration(seconds: 30),
-                receiveTimeout: const Duration(seconds: 60),
-              ));
-            }
 
             @override
             void initState() {
@@ -127,12 +114,49 @@ jobs:
                       _searchController.text = url;
                     },
                     onPageFinished: (url) {
-                      // Menu Bar-ஐ தவிர்த்து, சரியான பாடல் URL-களை எடுக்கும் JS எஞ்சின்
+                      // ★ உங்கள் Grabber.kt-ல் இருந்த அதே In-Browser Streamer Script ★
                       _webController.runJavaScript(r"""
                         var touchTimer = null;
                         var isBusy = false;
 
-                        // 1. ஆல்பத்திற்குள் உள்ள அனைத்து பாடல்களையும் சரியான URL உடன் எடுப்பது
+                        // பாடல் தரவுகளை Browser வழியாகவே துண்டு துண்டாக (Chunks) அனுப்பும் எஞ்சின்
+                        window.streamFileFromBrowser = async function(url, taskId) {
+                          try {
+                            var r = await fetch(url, {credentials: 'include'});
+                            if (!r.ok) {
+                              VidMateBridge.postMessage(JSON.stringify({type: 'dl_fail', id: taskId, err: 'HTTP ' + r.status}));
+                              return;
+                            }
+                            var reader = r.body.getReader();
+                            var total = parseInt(r.headers.get('content-length') || '0', 10);
+                            var loaded = 0;
+
+                            while (true) {
+                              var chunk = await reader.read();
+                              if (chunk.done) break;
+                              var bytes = chunk.value;
+                              loaded += bytes.length;
+
+                              var bin = '';
+                              for (var i = 0; i < bytes.length; i += 32768) {
+                                bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 32768));
+                              }
+                              var b64 = btoa(bin);
+
+                              VidMateBridge.postMessage(JSON.stringify({
+                                type: 'dl_chunk',
+                                id: taskId,
+                                data: b64,
+                                loaded: loaded,
+                                total: total
+                              }));
+                            }
+                            VidMateBridge.postMessage(JSON.stringify({type: 'dl_done', id: taskId}));
+                          } catch (e) {
+                            VidMateBridge.postMessage(JSON.stringify({type: 'dl_fail', id: taskId, err: String(e)}));
+                          }
+                        };
+
                         window.startBatchCrawl = async function(rootName, albums) {
                           for (var i = 0; i < albums.length; i++) {
                             var alb = albums[i];
@@ -143,8 +167,6 @@ jobs:
                               var doc = new DOMParser().parseFromString(html, 'text/html');
 
                               var seen = {};
-
-                              // அ. direct links, audio, source tags
                               doc.querySelectorAll('a[href], audio, source, [data-url]').forEach(function(el) {
                                 var href = el.getAttribute('href') || el.getAttribute('src') || el.getAttribute('data-url');
                                 if (href && href.match(/\.mp3/i)) {
@@ -154,36 +176,15 @@ jobs:
                                     if (!seen[full]) {
                                       seen[full] = true;
                                       VidMateBridge.postMessage(JSON.stringify({
-                                        type: 'queue_download',
+                                        type: 'init_download',
                                         url: full,
                                         subfolder: rootName + '/' + alb.name,
-                                        name: sName,
-                                        referer: alb.url
+                                        name: sName
                                       }));
                                     }
                                   } catch(x){}
                                 }
                               });
-
-                              // ஆ. HTML-ல் உள்ள முழு mp3 paths (songs/MyGM/...)
-                              var re = /["']([^"'<>\s]+\.mp3(?:\?[^"'<>\s]*)?)["']/gi;
-                              var m;
-                              while ((m = re.exec(html))) {
-                                try {
-                                  var full = new URL(m[1].replace(/&amp;/g, '&'), alb.url).href;
-                                  var sName = decodeURIComponent(full.split('/').pop().split('?')[0]);
-                                  if (!seen[full]) {
-                                    seen[full] = true;
-                                    VidMateBridge.postMessage(JSON.stringify({
-                                      type: 'queue_download',
-                                      url: full,
-                                      subfolder: rootName + '/' + alb.name,
-                                      name: sName,
-                                      referer: alb.url
-                                    }));
-                                  }
-                                } catch(x){}
-                              }
                             } catch(e) {}
                           }
                         };
@@ -210,13 +211,11 @@ jobs:
                           var title = link.innerText.trim() || (img ? img.alt : '') || link.title || 'Item';
                           var href = link.href;
 
-                          // 1. YouTube
                           if (href.includes('watch') || href.includes('youtu.be')) {
                             VidMateBridge.postMessage(JSON.stringify({type: 'youtube', url: href, name: title}));
                             return;
                           }
 
-                          // 2. Video
                           if (isVideoLink(link)) {
                             fetch(href, {credentials: 'include'})
                               .then(function(r){ return r.text(); })
@@ -231,7 +230,6 @@ jobs:
                                   if (cl.includes('1080')) q = "1080p HD";
                                   else if (cl.includes('720')) q = "720p HD";
                                   else if (cl.includes('480')) q = "480p";
-                                  else if (Object.keys(qs).length > 0) q = "Video " + (Object.keys(qs).length + 1);
                                   if (!qs[q]) qs[q] = cl;
                                 });
                                 VidMateBridge.postMessage(JSON.stringify({
@@ -248,7 +246,6 @@ jobs:
                             return;
                           }
 
-                          // 3. Folder Crawl (Menu Bar-ஐ தவிர்த்து உண்மையான ஆல்பங்களை மட்டும் எடுக்கும் முறை)
                           fetch(href, {credentials: 'include'})
                             .then(function(r){ return r.text(); })
                             .then(function(html){
@@ -270,7 +267,6 @@ jobs:
                                 }
                               });
 
-                              // Menu Bar Skip: header, nav, menu-ல் இருக்கும் பிற மொழிகளைத் தவிர்த்தல்
                               var subAlbums = [];
                               var skipSelector = 'nav, header, footer, [class*="menu"], [id*="menu"], [class*="nav"], [id*="nav"]';
                               doc.querySelectorAll('a').forEach(function(a){
@@ -335,14 +331,102 @@ jobs:
                   List<dynamic> subAlbums = data['subAlbums'] ?? [];
                   _showFolderDialog(data['name'], data['url'], songs, subAlbums);
                 }
-                else if (type == 'queue_download') {
-                  String fileUrl = data['url'];
-                  String subfolder = data['subfolder'];
-                  String name = data['name'];
-                  String referer = data['referer'];
-                  _startFileDownload(fileUrl, subfolder, referer, fileName: name);
+                // Browser வழியே டவுன்லோட் தொடங்குதல்
+                else if (type == 'init_download') {
+                  _initBrowserDownload(data['url'], data['subfolder'], data['name']);
+                }
+                // Browser அனுப்பும் Base64 Chunks-ஐ ஃபைலில் எழுதுதல்
+                else if (type == 'dl_chunk') {
+                  String taskId = data['id'];
+                  String b64 = data['data'];
+                  int loaded = data['loaded'] ?? 0;
+                  int total = data['total'] ?? 0;
+
+                  var task = _tasksMap[taskId];
+                  if (task != null && task.sink != null) {
+                    Uint8List bytes = base64Decode(b64);
+                    task.sink!.add(bytes);
+                    if (total > 0 && mounted) {
+                      setState(() {
+                        task.progress = loaded / total;
+                      });
+                    }
+                  }
+                }
+                // டவுன்லோட் முழுமையாக முடிந்தது
+                else if (type == 'dl_done') {
+                  String taskId = data['id'];
+                  var task = _tasksMap[taskId];
+                  if (task != null) {
+                    task.sink?.flush();
+                    task.sink?.close();
+                    if (mounted) {
+                      setState(() {
+                        task.status = 'completed';
+                        _tasksMap.remove(taskId);
+                      });
+                      _loadDownloadedFiles();
+                    }
+                  }
+                }
+                // தோல்வியடைந்தால்
+                else if (type == 'dl_fail') {
+                  String taskId = data['id'];
+                  var task = _tasksMap[taskId];
+                  if (task != null) {
+                    task.sink?.close();
+                    task.file?.delete();
+                    if (mounted) {
+                      setState(() {
+                        task.status = 'failed';
+                      });
+                    }
+                  }
                 }
               } catch (_) {}
+            }
+
+            // In-Browser Stream File Initializer
+            Future<void> _initBrowserDownload(String fileUrl, String subfolder, String fileName) async {
+              String taskId = DateTime.now().millisecondsSinceEpoch.toString() + fileUrl.hashCode.toString();
+              String name = fileName.replaceAll(RegExp(r'[^\w\s\.\-]+'), '').trim();
+              if (!name.toLowerCase().endsWith('.mp3') && !name.toLowerCase().endsWith('.mp4')) {
+                name = "$name.mp3";
+              }
+
+              try {
+                Directory baseDir = Directory('/storage/emulated/0/Download');
+                try {
+                  if (!await baseDir.exists()) baseDir = (await getExternalStorageDirectory())!;
+                } catch (_) {
+                  baseDir = (await getExternalStorageDirectory())!;
+                }
+
+                Directory targetDir = Directory('${baseDir.path}/$subfolder');
+                if (!await targetDir.exists()) await targetDir.create(recursive: true);
+
+                File f = File('${targetDir.path}/$name');
+                IOSink sink = f.openWrite();
+
+                var task = DownloadTask(
+                  id: taskId,
+                  name: name,
+                  subfolder: subfolder,
+                  sink: sink,
+                  file: f,
+                );
+
+                setState(() {
+                  _tasksMap[taskId] = task;
+                });
+
+                // Browser-க்குள் fetch Stream தொடங்க ஆணையிடுகிறோம்!
+                _webController.runJavaScript('''
+                  window.streamFileFromBrowser(${jsonEncode(fileUrl)}, ${jsonEncode(taskId)});
+                ''');
+              } catch (e) {
+                print("Init error: $e");
+              }
             }
 
             void _showVideoQualityDialog(String title, String thumb, Map<String, String> qualities, String referer) {
@@ -412,7 +496,7 @@ jobs:
                                   String streamUrl = qualities[selectedFormat]!;
                                   String cleanTitle = title.replaceAll(RegExp(r'[^\w\s]+'), '').trim();
                                   if (cleanTitle.isEmpty) cleanTitle = "Video";
-                                  _startFileDownload(streamUrl, "Videos", referer, fileName: "$cleanTitle-$selectedFormat.mp4");
+                                  _initBrowserDownload(streamUrl, "Videos", "$cleanTitle-$selectedFormat.mp4");
                                   setState(() {
                                     _downloadedQualities[selectedFormat] = true;
                                     _currentTab = 2;
@@ -454,7 +538,7 @@ jobs:
                           for (var s in songs) {
                             String sUrl = s['url'].toString();
                             String sTitle = s['title'].toString();
-                            _startFileDownload(sUrl, cleanName, folderUrl, fileName: sTitle);
+                            _initBrowserDownload(sUrl, cleanName, sTitle);
                           }
                           setState(() => _currentTab = 2);
                         },
@@ -499,76 +583,6 @@ jobs:
                     ],
                   ),
                 );
-              }
-            }
-
-            // ★ Permission Denied வராமல் மற்றும் தவறான URL இல்லாத பாதுகாப்பான டவுன்லோடர் ★
-            Future<void> _startFileDownload(String fileUrl, String subfolder, String referer, {String? fileName}) async {
-              String name = fileName ?? Uri.decodeComponent(fileUrl.split('/').last.split('?').first);
-              if (!name.toLowerCase().endsWith('.mp3') && !name.toLowerCase().endsWith('.mp4')) {
-                name = "$name.mp3";
-              }
-              name = name.replaceAll(RegExp(r'[^\w\s\.\-]+'), '').trim();
-
-              CancelToken cancelToken = CancelToken();
-              var task = DownloadTask(
-                id: DateTime.now().millisecondsSinceEpoch.toString() + fileUrl.hashCode.toString(),
-                name: name,
-                subfolder: subfolder,
-                cancelToken: cancelToken,
-              );
-
-              setState(() {
-                _activeTasks.add(task);
-              });
-
-              try {
-                // Android 11+ Permission Denied வராமல் தடுக்கும் வழிமுறை
-                Directory baseDir = Directory('/storage/emulated/0/Download');
-                try {
-                  if (!await baseDir.exists()) {
-                    baseDir = (await getExternalStorageDirectory())!;
-                  }
-                } catch (_) {
-                  baseDir = (await getExternalStorageDirectory())!;
-                }
-
-                Directory targetDir = Directory('${baseDir.path}/$subfolder');
-                if (!await targetDir.exists()) {
-                  await targetDir.create(recursive: true);
-                }
-
-                String savePath = "${targetDir.path}/$name";
-
-                var dio = _getSafeDio(referer);
-                await dio.download(
-                  fileUrl,
-                  savePath,
-                  cancelToken: cancelToken,
-                  onReceiveProgress: (received, total) {
-                    if (total > 0 && mounted) {
-                      setState(() {
-                        task.progress = received / total;
-                      });
-                    }
-                  },
-                );
-
-                if (mounted) {
-                  setState(() {
-                    task.status = 'completed';
-                    _activeTasks.remove(task);
-                  });
-                  _loadDownloadedFiles();
-                }
-              } catch (e) {
-                // தவறுதலாக அமைதியாக மறையாமல் Error Message-ஐ திரையில் காட்டும்
-                if (mounted) {
-                  setState(() {
-                    task.status = 'failed';
-                    task.errorMsg = e.toString();
-                  });
-                }
               }
             }
 
@@ -693,26 +707,29 @@ jobs:
             Future<void> _downloadYouTubeStream(Video video, dynamic streamInfo, String quality) async {
               String cleanTitle = video.title.replaceAll(RegExp(r'[^\w\s]+'), '');
               String fileName = "$cleanTitle-$quality.mp4";
+              String taskId = DateTime.now().millisecondsSinceEpoch.toString();
+
+              Directory baseDir = Directory('/storage/emulated/0/Download');
+              if (!await baseDir.exists()) baseDir = (await getExternalStorageDirectory())!;
+              var file = File('${baseDir.path}/$fileName');
+              var fileStream = file.openWrite();
 
               var task = DownloadTask(
-                id: DateTime.now().millisecondsSinceEpoch.toString(),
+                id: taskId,
                 name: fileName,
                 subfolder: "YouTube",
+                sink: fileStream,
+                file: file,
               );
 
               setState(() {
-                _activeTasks.add(task);
+                _tasksMap[taskId] = task;
                 _currentTab = 2;
               });
 
               var yt = YoutubeExplode();
               var stream = yt.videos.streamsClient.get(streamInfo);
 
-              Directory baseDir = Directory('/storage/emulated/0/Download');
-              if (!await baseDir.exists()) baseDir = (await getExternalStorageDirectory())!;
-              var file = File('${baseDir.path}/$fileName');
-
-              var fileStream = file.openWrite();
               await stream.pipe(fileStream);
               await fileStream.flush();
               await fileStream.close();
@@ -720,7 +737,7 @@ jobs:
 
               setState(() {
                 _downloadedQualities[quality] = true;
-                _activeTasks.remove(task);
+                _tasksMap.remove(taskId);
               });
               _loadDownloadedFiles();
               ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("✅ Saved $quality (✓✓)!")));
@@ -773,6 +790,8 @@ jobs:
 
             @override
             Widget build(BuildContext context) {
+              var tasksList = _tasksMap.values.toList();
+
               return Scaffold(
                 appBar: AppBar(
                   backgroundColor: Colors.white,
@@ -856,7 +875,7 @@ jobs:
                             unselectedLabelColor: Colors.grey,
                             indicatorColor: Colors.red,
                             tabs: [
-                              Tab(text: "Downloading (${_activeTasks.length})"),
+                              Tab(text: "Downloading (${tasksList.length})"),
                               Tab(text: "Downloaded (${_downloadedFiles.length})"),
                             ],
                           ),
@@ -865,13 +884,12 @@ jobs:
                           child: TabBarView(
                             controller: _downloadTabController,
                             children: [
-                              _activeTasks.isEmpty
+                              tasksList.isEmpty
                                   ? const Center(child: Text("டவுன்லோட் எதுவும் இல்லை!"))
                                   : ListView.builder(
-                                      itemCount: _activeTasks.length,
+                                      itemCount: tasksList.length,
                                       itemBuilder: (ctx, i) {
-                                        var t = _activeTasks[i];
-                                        bool isErr = t.status == 'failed';
+                                        var t = tasksList[i];
                                         return Card(
                                           margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                                           child: Padding(
@@ -885,24 +903,15 @@ jobs:
                                                 const SizedBox(height: 8),
                                                 LinearProgressIndicator(
                                                   value: t.progress > 0 ? t.progress : null,
-                                                  color: isErr ? Colors.grey : Colors.red,
+                                                  color: Colors.red,
                                                   backgroundColor: Colors.grey[200],
                                                 ),
                                                 const SizedBox(height: 6),
                                                 Row(
                                                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                                                   children: [
-                                                    Text(
-                                                      isErr ? "Failed (Retry)" : "${(t.progress * 100).toStringAsFixed(1)}%",
-                                                      style: TextStyle(color: isErr ? Colors.red : Colors.black87, fontSize: 12),
-                                                    ),
-                                                    IconButton(
-                                                      icon: const Icon(Icons.cancel, color: Colors.grey, size: 20),
-                                                      onPressed: () {
-                                                        t.cancelToken?.cancel();
-                                                        setState(() => _activeTasks.remove(t));
-                                                      },
-                                                    )
+                                                    Text("${(t.progress * 100).toStringAsFixed(1)}%", style: const TextStyle(fontSize: 12)),
+                                                    Text(t.status, style: const TextStyle(fontSize: 11, color: Colors.grey)),
                                                   ],
                                                 )
                                               ],
