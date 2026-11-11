@@ -24,7 +24,7 @@ jobs:
         with:
           channel: 'stable'
 
-      - name: Create App & Inject Perfect VidMate Code
+      - name: Create App & Inject Batch Subfolder Downloader
         run: |
           flutter create my_downloader --org com.myvidmate.app
           cd my_downloader
@@ -125,10 +125,37 @@ jobs:
                       _searchController.text = url;
                     },
                     onPageFinished: (url) {
-                      // ★ FolderGrab-ல் வெற்றிகரமாக வேலை செய்த அதே In-Browser Fetch JS தந்திரம் ★
                       _webController.runJavaScript(r"""
                         var touchTimer = null;
                         var isBusy = false;
+
+                        // 242 ஆல்பங்களையும் பின்னணியில் வரிசையாக டவுன்லோட் செய்யும் Batch Engine
+                        window.startBatchCrawl = async function(rootName, albums) {
+                          for (var i = 0; i < albums.length; i++) {
+                            var alb = albums[i];
+                            try {
+                              var res = await fetch(alb.url, {credentials: 'include'});
+                              if (!res.ok) continue;
+                              var html = await res.text();
+                              var matches = html.match(/[^\s"\'<>\\\/=]+\.mp3/gi) || [];
+                              var seen = {};
+                              matches.forEach(function(m) {
+                                var full = new URL(m, alb.url).href;
+                                var sName = decodeURIComponent(m.split('?')[0]);
+                                if (!seen[full]) {
+                                  seen[full] = true;
+                                  VidMateBridge.postMessage(JSON.stringify({
+                                    type: 'queue_download',
+                                    url: full,
+                                    subfolder: rootName + '/' + alb.name,
+                                    name: sName,
+                                    referer: alb.url
+                                  }));
+                                }
+                              });
+                            } catch(e) {}
+                          }
+                        };
 
                         function isVideoLink(link) {
                           var href = (link.href || '').toLowerCase();
@@ -152,13 +179,13 @@ jobs:
                           var title = link.innerText.trim() || (img ? img.alt : '') || link.title || 'Item';
                           var href = link.href;
 
-                          // 1. YouTube என்றால்
+                          // 1. YouTube
                           if (href.includes('watch') || href.includes('youtu.be')) {
                             VidMateBridge.postMessage(JSON.stringify({type: 'youtube', url: href, name: title}));
                             return;
                           }
 
-                          // 2. Video என்றால்
+                          // 2. Video Qualities
                           if (isVideoLink(link)) {
                             fetch(href, {credentials: 'include'})
                               .then(function(r){ return r.text(); })
@@ -190,7 +217,7 @@ jobs:
                             return;
                           }
 
-                          // 3. Folder என்றால் (FolderGrab முறையில் 403 பிழை வராமல் Browser-க்குள் fetch)
+                          // 3. Folder Crawl
                           fetch(href, {credentials: 'include'})
                             .then(function(r){ return r.text(); })
                             .then(function(html){
@@ -251,31 +278,32 @@ jobs:
               try {
                 var data = jsonDecode(jsonStr);
                 String type = data['type'];
-                String url = data['url'];
-                String name = data['name'];
 
                 if (type == 'youtube') {
-                  _fetchYouTubeInfo(url);
+                  _fetchYouTubeInfo(data['url']);
                 } 
                 else if (type == 'video_qualities') {
                   Map<String, dynamic> rawQ = data['qualities'] ?? {};
                   String thumb = data['thumb'] ?? '';
                   Map<String, String> qMap = rawQ.map((k, v) => MapEntry(k.toString(), v.toString()));
-                  if (qMap.isNotEmpty) {
-                    _showVideoQualityDialog(name, thumb, qMap, url);
-                  } else {
-                    _showVideoQualityDialog(name, thumb, {'Original MP4': url}, url);
-                  }
+                  _showVideoQualityDialog(data['name'], thumb, qMap.isNotEmpty ? qMap : {'Original MP4': data['url']}, data['url']);
                 } 
                 else if (type == 'folder_result') {
                   List<dynamic> songs = data['songs'] ?? [];
                   List<dynamic> subAlbums = data['subAlbums'] ?? [];
-                  _showFolderDialog(name, url, songs, subAlbums);
+                  _showFolderDialog(data['name'], data['url'], songs, subAlbums);
+                }
+                // பின்னணியில் ஆல்பங்கள் வரிசையாக டவுன்லோட் ஆவது
+                else if (type == 'queue_download') {
+                  String fileUrl = data['url'];
+                  String subfolder = data['subfolder'];
+                  String name = data['name'];
+                  String referer = data['referer'];
+                  _startFileDownload(fileUrl, subfolder, referer, fileName: name);
                 }
               } catch (_) {}
             }
 
-            // 1. Video Quality Selection Popup (VidMate Style)
             void _showVideoQualityDialog(String title, String thumb, Map<String, String> qualities, String referer) {
               String selectedFormat = qualities.keys.first;
 
@@ -360,7 +388,7 @@ jobs:
               );
             }
 
-            // 2. Folder Dialog (403 பிழை இல்லாமல் நேரடியாகப் பாடல்களை எடுக்கும் முறை)
+            // ★ நீங்கள் கேட்டபடி "Open Album" நீக்கப்பட்டு "Download All (242 Albums)" வைக்கப்பட்டுள்ளது ★
             void _showFolderDialog(String folderName, String folderUrl, List<dynamic> songs, List<dynamic> subAlbums) {
               String cleanName = folderName.replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
               if (cleanName.isEmpty) cleanName = "Album";
@@ -395,21 +423,40 @@ jobs:
                     ],
                   ),
                 );
-              } else if (subAlbums.isNotEmpty) {
+              } 
+              // 242 Albums பட்டியல் இருக்கும் போது
+              else if (subAlbums.isNotEmpty) {
                 showDialog(
                   context: context,
                   builder: (ctx) => AlertDialog(
-                    title: Text("📁 $cleanName"),
-                    content: Text("இதில் ${subAlbums.length} Albums உள்ளன (Aalayamani, Amaithikaaga...). அனைத்தையும் Subfolder அமைப்பில் பார்க்க திறந்து செல்லவா?"),
+                    title: Row(
+                      children: [
+                        const Icon(Icons.folder_special, color: Colors.blue, size: 28),
+                        const SizedBox(width: 8),
+                        Expanded(child: Text(cleanName, style: const TextStyle(fontWeight: FontWeight.bold))),
+                      ],
+                    ),
+                    content: Text(
+                      "இதில் ${subAlbums.length} Albums உள்ளன (Aalayamani, Amaithikaaga...).\n\n"
+                      "அனைத்து Albums மற்றும் அதனுள் இருக்கும் பாடல்களையும் 'Download/$cleanName/' மெயின் Folder-க்குள் Subfolders அமைப்பில் டவுன்லோட் செய்யவா?",
+                    ),
                     actions: [
                       TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
                       ElevatedButton(
                         style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
                         onPressed: () {
                           Navigator.pop(ctx);
-                          _webController.loadRequest(Uri.parse(folderUrl));
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(content: Text("'$cleanName': ${subAlbums.length} Albums டவுன்லோட் துவங்குகிறது...")),
+                          );
+                          // 242 Albums-களையும் பின்னணியில் தானாகச் சென்று டவுன்லோட் செய்கிறது
+                          String albumsJson = jsonEncode(subAlbums);
+                          _webController.runJavaScript('''
+                            window.startBatchCrawl(${jsonEncode(cleanName)}, $albumsJson);
+                          ''');
+                          setState(() => _currentTab = 2); // Downloads பக்கத்திற்கு அழைத்துச் செல்லும்
                         },
-                        child: const Text("Open Album", style: TextStyle(color: Colors.white)),
+                        child: Text("Download All (${subAlbums.length} Albums)", style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
                       )
                     ],
                   ),
@@ -470,7 +517,6 @@ jobs:
               }
             }
 
-            // YouTube Downloader
             void _fetchYouTubeInfo(String url) async {
               if (_isBottomSheetOpen || _isLoading) return;
               _isBottomSheetOpen = true;
