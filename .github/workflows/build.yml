@@ -24,6 +24,12 @@ jobs:
         with:
           channel: 'stable'
 
+      # ★ Uninstall செய்யாமல் வாழ்நாள் முழுவதும் Update ஆக நிலையான கையொப்பம் (Keystore) ★
+      - name: Setup Permanent Signing Key
+        run: |
+          mkdir -p ~/.android
+          curl -sL -o ~/.android/debug.keystore https://raw.githubusercontent.com/CoreProc/android-debug-keystore/master/debug.keystore
+
       - name: Create App & Inject Strict Hierarchy Downloader
         run: |
           flutter create my_downloader --org com.myvidmate.app
@@ -139,16 +145,13 @@ jobs:
                         var isBusy = false;
                         window.__pausedTasks = window.__pausedTasks || {};
 
-                        // ★ Sidebar மற்றும் பொதுவான மெனுக்களை முற்றிலுமாகத் தவிர்க்கும் வடிகட்டி ★
                         var skipNavSelector = 'aside, nav, header, footer, [class*="sidebar"], [id*="sidebar"], [class*="category"], [class*="categories"], [id*="category"], [id*="categories"], .left_column, #left_column, .left-col, #left-col, [class*="menu"], [id*="menu"]';
 
-                        // உண்மை துணை-ஃபோல்டர் (Subfolder) தானா என ஆராயும் முறை
                         function isActualSubfolder(parentUrl, childUrl) {
                           try {
                             var p = new URL(parentUrl), c = new URL(childUrl);
                             if (p.hostname.replace(/^www\./,'') !== c.hostname.replace(/^www\./,'')) return false;
 
-                            // ?folder= அல்லது ?album= வழியே இருந்தால்
                             var keys = ['album', 'folder', 'dir', 'cat', 'category', 'id'];
                             for (var i = 0; i < keys.length; i++) {
                               var k = keys[i];
@@ -159,7 +162,6 @@ jobs:
                               }
                             }
 
-                            // Path வழியே இருந்தால் (/songs/Deva_Hits/CD1)
                             var pDir = p.pathname.replace(/\/+$/, '') + '/';
                             if (c.pathname.startsWith(pDir) && c.pathname !== pDir) {
                               return true;
@@ -216,7 +218,6 @@ jobs:
                           window.__pausedTasks[taskId] = true;
                         };
 
-                        // Sidebar-ஐ முற்றிலும் தவிர்த்து, தேர்ந்தெடுத்த ஆல்பத்தின் பாடல்களை மட்டுமே எடுக்கும் எஞ்சின்
                         async function crawlDeepFolderSilently(folderPath, pageUrl, depth) {
                           if (depth > 4) return;
                           try {
@@ -226,9 +227,7 @@ jobs:
                             var doc = new DOMParser().parseFromString(html, 'text/html');
 
                             var seen = {};
-                            // 1. இந்த ஆல்பத்தில் உள்ள பாடல்களை மட்டும் எடுத்தல்
                             doc.querySelectorAll('a[href], audio, source, [data-url]').forEach(function(el) {
-                              // Sidebar-ல் இருக்கும் இணைப்புகளைத் தவிர்த்தல்
                               if (el.closest(skipNavSelector)) return;
 
                               var href = el.getAttribute('href') || el.getAttribute('src') || el.getAttribute('data-url');
@@ -250,7 +249,6 @@ jobs:
                               }
                             });
 
-                            // 2. உள்ளே இருக்கும் நேரடி Subfolder (எ.கா: CD 1) என்றால் மட்டுமே உள்ளே செல்லும்
                             doc.querySelectorAll('a[href]').forEach(function(a) {
                               if (a.closest(skipNavSelector)) return;
 
@@ -259,7 +257,6 @@ jobs:
                               if (aTxt.length > 1 && aHref && !aHref.startsWith('javascript') && !aHref.includes('#') && !aTxt.endsWith('.mp3')) {
                                 try {
                                   var nextUrl = new URL(aHref, pageUrl).href;
-                                  // Sidebar லிங்க் அல்லாமல், இதன் உண்மையான Subfolder என்றால் மட்டுமே செல்லும்
                                   if (isActualSubfolder(pageUrl, nextUrl)) {
                                     crawlDeepFolderSilently(folderPath + '/' + aTxt, nextUrl, depth + 1);
                                   }
@@ -287,8 +284,6 @@ jobs:
 
                         function processLink(link, ev) {
                           if (isBusy || !link || !link.href) return;
-
-                          // பயனர் Long Press செய்தது Sidebar / Categories மெனு என்றால் அதை எடுக்காது!
                           if (link.closest(skipNavSelector)) return;
 
                           isBusy = true;
@@ -299,13 +294,11 @@ jobs:
                           var title = link.innerText.trim() || (img ? img.alt : '') || link.title || 'Item';
                           var href = link.href;
 
-                          // 1. YouTube
                           if (href.includes('watch') || href.includes('youtu.be')) {
                             VidMateBridge.postMessage(JSON.stringify({type: 'youtube', url: href, name: title}));
                             return;
                           }
 
-                          // 2. Video Qualities
                           if (isVideoLink(link)) {
                             fetch(href, {credentials: 'include'})
                               .then(function(r){ return r.text(); })
@@ -336,7 +329,6 @@ jobs:
                             return;
                           }
 
-                          // 3. நீங்கள் தேர்வு செய்த ஆல்பத்திற்கு மட்டும் Pop-up கேட்கும்
                           VidMateBridge.postMessage(JSON.stringify({
                             type: 'folder_long_press',
                             url: href,
@@ -480,7 +472,6 @@ jobs:
                           SnackBar(content: Text("'$cleanName' டவுன்லோட் தொடங்குகிறது...")),
                         );
 
-                        // Sidebar தவிர்த்து இந்த ஆல்பத்தின் பாடல்களை மட்டுமே டவுன்லோட் செய்கிறது
                         _webController.runJavaScript('''
                           window.startAutoCrawl(${jsonEncode(cleanName)}, ${jsonEncode(folderUrl)});
                         ''');
@@ -1111,7 +1102,10 @@ jobs:
           sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.CAMERA"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>' android/app/src/main/AndroidManifest.xml
           sed -i 's/<application/<application android:usesCleartextTraffic="true" android:requestLegacyExternalStorage="true"/' android/app/src/main/AndroidManifest.xml
 
-      - name: Build Release APK
+          # ★ ரிலீஸ் பில்டிலும் நிலையான Keystore கையொப்பத்தை உறுதி செய்கிறோம் ★
+          sed -i 's/signingConfig = signingConfigs.release/signingConfig = signingConfigs.debug/g' my_downloader/android/app/build.gradle* 2>/dev/null || true
+
+      - name: Build Release APK with Fixed Permanent Keystore
         run: |
           cd my_downloader
           flutter build apk --release --build-number=${{ github.run_number }} --build-name=1.0.${{ github.run_number }}
