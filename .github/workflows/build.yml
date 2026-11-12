@@ -10,34 +10,34 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repository
+      - name: 1. Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Java
+      - name: 2. Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Set up Flutter
+      - name: 3. Set up Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
 
-      # நிலையான கையொப்பம்
-      - name: Setup Permanent Signing Key
+      - name: 4. Setup Permanent Signing Key
         run: |
           mkdir -p ~/.android
           curl -sL -o ~/.android/debug.keystore https://raw.githubusercontent.com/CoreProc/android-debug-keystore/master/debug.keystore
 
-      - name: Create App & Inject Stable Clean Downloader
+      - name: 5. Create Project & Add Packages
         run: |
           flutter create my_downloader --org com.myvidmate.app
           cd my_downloader
-          
           flutter pub add webview_flutter youtube_explode_dart dio path_provider shared_preferences
 
-          cat << 'EOF' > lib/main.dart
+      - name: 6. Inject Full App Code
+        run: |
+          cat << 'EOF' > my_downloader/lib/main.dart
           import 'dart:convert';
           import 'dart:io';
           import 'package:flutter/material.dart';
@@ -47,704 +47,266 @@ jobs:
           import 'package:dio/dio.dart';
           import 'package:shared_preferences/shared_preferences.dart';
 
-          void main() {
-            runApp(const MaterialApp(
-              debugShowCheckedModeBanner: false,
-              home: MainMasterApp(),
-            ));
-          }
+          void main() => runApp(const MaterialApp(debugShowCheckedModeBanner: false, home: VidMateApp()));
 
           class DownloadTask {
-            final String id;
-            final String name;
-            final String subfolder;
-            final String fileUrl;
-            final String sourcePage;
+            final String id, name, subfolder, fileUrl, sourcePage;
             double progress;
             String status;
             CancelToken? cancelToken;
-
-            DownloadTask({
-              required this.id,
-              required this.name,
-              required this.subfolder,
-              required this.fileUrl,
-              required this.sourcePage,
-              this.progress = 0.0,
-              this.status = 'downloading',
-              this.cancelToken,
-            });
+            DownloadTask({required this.id, required this.name, required this.subfolder, required this.fileUrl, required this.sourcePage, this.progress = 0.0, this.status = 'downloading', this.cancelToken});
           }
 
-          class MainMasterApp extends StatefulWidget {
-            const MainMasterApp({super.key});
-
+          class VidMateApp extends StatefulWidget {
+            const VidMateApp({super.key});
             @override
-            State<MainMasterApp> createState() => _MainMasterAppState();
+            State<VidMateApp> createState() => _VidMateAppState();
           }
 
-          class _MainMasterAppState extends State<MainMasterApp> with SingleTickerProviderStateMixin {
+          class _VidMateAppState extends State<VidMateApp> with SingleTickerProviderStateMixin {
             int _currentTab = 0;
-            late TabController _downloadTabController;
-            late final WebViewController _webController;
-            final TextEditingController _searchController = TextEditingController();
-            final FocusNode _searchFocusNode = FocusNode();
-            
-            bool _isLoading = false;
-            bool _isBottomSheetOpen = false;
-            bool _isCurrentUrlBookmarked = false;
-            DateTime? _lastBackPressTime;
-
-            bool _isDesktopMode = false;
-            static const String desktopUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
-            static const String mobileUA = "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36";
-
-            final Map<String, DownloadTask> _tasksMap = {};
+            late TabController _tabController;
+            late final WebViewController _web;
+            final TextEditingController _urlCtrl = TextEditingController();
+            final FocusNode _focus = FocusNode();
+            bool _isLoading = false, _isBookmarked = false, _desktop = false;
+            DateTime? _lastBack;
+            final Map<String, DownloadTask> _tasks = {};
             List<Map<String, String>> _bookmarks = [];
-            Map<String, bool> _downloadedQualities = {};
-            List<FileSystemEntity> _downloadedFiles = [];
+            List<FileSystemEntity> _files = [];
 
-            Dio _getSafeDio(String refererUrl) {
-              return Dio(BaseOptions(
-                headers: {
-                  'User-Agent': _isDesktopMode ? desktopUA : mobileUA,
-                  'Accept': '*/*',
-                  'Referer': refererUrl,
-                },
-                followRedirects: true,
-                connectTimeout: const Duration(seconds: 30),
-                receiveTimeout: const Duration(seconds: 60),
-              ));
-            }
+            static const String dUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+            static const String mUA = "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36";
+
+            Dio _dio(String ref) => Dio(BaseOptions(headers: {'User-Agent': _desktop ? dUA : mUA, 'Accept': '*/*', 'Referer': ref}, followRedirects: true, connectTimeout: const Duration(seconds: 30)));
 
             @override
             void initState() {
               super.initState();
-              _downloadTabController = TabController(length: 2, vsync: this);
-              _loadBookmarks();
-              _loadDownloadedFiles();
+              _tabController = TabController(length: 2, vsync: this);
+              _loadSaved();
+              _focus.addListener(() { if (mounted) setState(() {}); });
 
-              _searchFocusNode.addListener(() {
-                if (mounted) setState(() {});
-              });
-
-              _webController = WebViewController()
+              _web = WebViewController()
                 ..setJavaScriptMode(JavaScriptMode.unrestricted)
-                ..setUserAgent(mobileUA)
-                ..addJavaScriptChannel(
-                  'VidMateBridge',
-                  onMessageReceived: (JavaScriptMessage msg) {
-                    _handleBridgeMessage(msg.message);
-                  },
-                )
-                ..setNavigationDelegate(
-                  NavigationDelegate(
-                    onPageStarted: (url) {
-                      _searchController.text = url;
-                      _updateBookmarkIcon(url);
-                      if (mounted) setState(() => _isLoading = true);
-                    },
-                    onPageFinished: (url) {
-                      if (mounted) setState(() => _isLoading = false);
-                      _updateBookmarkIcon(url);
-
-                      _webController.runJavaScript(r"""
-                        var touchTimer = null;
-                        var isBusy = false;
-
-                        function isVideoLink(link) {
-                          var href = (link.href || '').toLowerCase();
-                          var text = (link.innerText + ' ' + (link.getAttribute('aria-label') || '')).toLowerCase();
-                          if (href.includes('watch') || href.includes('youtu.be') || href.includes('video') || 
-                              href.includes('view') || href.includes('play') || href.includes('.mp4') || 
-                              href.includes('clip') || href.includes('movie')) return true;
-                          if (text.includes('sec') || text.includes('min') || text.includes('360p') || 
-                              text.includes('720p') || text.includes('1080p') || text.includes('hd')) return true;
-                          if (link.querySelector('img') && (text.match(/\d+:\d+/) || text.match(/\d+\s*min/))) return true;
-                          return false;
-                        }
-
-                        function processLink(link) {
-                          if (isBusy || !link || !link.href) return;
-                          isBusy = true;
-                          setTimeout(function() { isBusy = false; }, 1800);
-
-                          var img = link.querySelector('img');
-                          var thumb = img ? img.src : '';
-                          var title = link.innerText.trim() || (img ? img.alt : '') || link.title || 'Item';
-                          var href = link.href;
-
-                          // 1. YouTube
-                          if (href.includes('watch') || href.includes('youtu.be')) {
-                            VidMateBridge.postMessage(JSON.stringify({type: 'youtube', url: href, name: title}));
-                            return;
-                          }
-
-                          // 2. Video Qualities
-                          if (isVideoLink(link)) {
-                            fetch(href, {credentials: 'include'})
-                              .then(function(r){ return r.text(); })
-                              .then(function(html){
-                                var unescaped = html.replace(/\\\//g, '/');
-                                var qs = {};
-
-                                var mp4Regex = /(https?:\/\/[^\s"'<>\\]+?\.(?:mp4|webm|m3u8)(?:\?[^\s"'<>\\]*)?)/gi;
-                                var m = unescaped.match(mp4Regex) || [];
-                                m.forEach(function(u){
-                                  var cl = u.replace(/["']/g, '');
-                                  var q = "360p SD";
-                                  if (cl.includes('1080')) q = "1080p HD";
-                                  else if (cl.includes('720')) q = "720p HD";
-                                  else if (cl.includes('480')) q = "480p";
-                                  else if (cl.includes('240')) q = "240p";
-                                  else if (Object.keys(qs).length > 0) q = "Video " + (Object.keys(qs).length + 1);
-                                  if (!qs[q]) qs[q] = cl;
-                                });
-
-                                var relRegex = /(["'](\/[^"'<>\s\\]+?\.(?:mp4|webm)(?:\?[^"'<>\s\\]*)?)["'])/gi;
-                                var rm;
-                                while ((rm = relRegex.exec(unescaped)) !== null) {
-                                  try {
-                                    var full = new URL(rm[2], href).href;
-                                    var rq = "360p (MP4)";
-                                    if (rm[2].includes('720')) rq = "720p HD";
-                                    if (!qs[rq]) qs[rq] = full;
-                                  } catch(e){}
-                                }
-
-                                VidMateBridge.postMessage(JSON.stringify({
-                                  type: 'video_qualities',
-                                  url: href,
-                                  name: title,
-                                  thumb: thumb,
-                                  qualities: qs
-                                }));
-                              })
-                              .catch(function(){
-                                VidMateBridge.postMessage(JSON.stringify({
-                                  type: 'video_qualities',
-                                  url: href,
-                                  name: title,
-                                  thumb: thumb,
-                                  qualities: {'Direct MP4': href}
-                                }));
-                              });
-                            return;
-                          }
-
-                          // 3. Audio / Folder Long Press (MyGreatMaster)
-                          fetch(href, {credentials: 'include'})
-                            .then(function(r){ return r.text(); })
-                            .then(function(html){
-                              var doc = new DOMParser().parseFromString(html, 'text/html');
-                              var songs = [];
-                              var seen = {};
-
-                              doc.querySelectorAll('a[href], audio, source, [data-url]').forEach(function(el) {
-                                var h = el.getAttribute('href') || el.getAttribute('src') || el.getAttribute('data-url');
-                                if (h && h.match(/\.(mp3|m4a|wav|aac)/i)) {
-                                  try {
-                                    var full = new URL(h, href).href;
-                                    var sName = el.innerText.trim() || decodeURIComponent(full.split('/').pop().split('?')[0]);
-                                    if (!seen[full]) {
-                                      seen[full] = true;
-                                      songs.push({title: sName, url: full});
-                                    }
-                                  } catch(x){}
-                                }
-                              });
-
-                              VidMateBridge.postMessage(JSON.stringify({
-                                type: 'folder_result',
-                                url: href,
-                                name: title,
-                                songs: songs
-                              }));
-                            })
-                            .catch(function(){});
-                        }
-
-                        document.addEventListener('contextmenu', function(e) {
-                          var link = e.target.closest('a');
-                          if (link) { e.preventDefault(); processLink(link); }
-                        }, true);
-
-                        document.addEventListener('touchstart', function(e) {
-                          var link = e.target.closest('a');
-                          if (link) {
-                            touchTimer = setTimeout(function() { processLink(link); }, 650);
-                          }
-                        }, {passive: true});
-
-                        document.addEventListener('touchend', function() { if (touchTimer) clearTimeout(touchTimer); }, {passive: true});
-                        document.addEventListener('touchmove', function() { if (touchTimer) clearTimeout(touchTimer); }, {passive: true});
-                      """);
-                    },
-                  ),
-                )
+                ..setUserAgent(mUA)
+                ..addJavaScriptChannel('Bridge', onMessageReceived: (m) => _onJs(m.message))
+                ..setNavigationDelegate(NavigationDelegate(
+                  onPageStarted: (u) { _urlCtrl.text = u; _checkBm(u); if (mounted) setState(() => _isLoading = true); },
+                  onPageFinished: (u) { if (mounted) setState(() => _isLoading = false); _checkBm(u); _injectJs(); },
+                ))
                 ..loadRequest(Uri.parse('https://m.youtube.com'));
             }
 
-            void _updateBookmarkIcon(String? url) {
-              if (url == null) return;
-              if (mounted) {
-                setState(() {
-                  _isCurrentUrlBookmarked = _bookmarks.any((b) => b['url'] == url);
-                });
-              }
+            void _injectJs() {
+              _web.runJavaScript(r"""
+                function scan() {
+                  var songs = [], seen = {};
+                  document.querySelectorAll('a[href], audio, source').forEach(function(el) {
+                    var h = el.getAttribute('href') || el.getAttribute('src');
+                    if (h && h.match(/\.(mp3|m4a|wav|aac)/i)) {
+                      try {
+                        var full = new URL(h, location.href).href;
+                        var name = el.innerText.trim() || decodeURIComponent(full.split('/').pop().split('?')[0]);
+                        if (!seen[full]) { seen[full] = true; songs.push({name: name, url: full}); }
+                      } catch(x){}
+                    }
+                  });
+                  return songs;
+                }
+                function scanVids() {
+                  var un = document.documentElement.outerHTML.replace(/\\\//g, '/');
+                  var qs = {};
+                  var m = un.match(/(https?:\/\/[^\s"'<>\\]+?\.(?:mp4|webm|m3u8)(?:\?[^\s"'<>\\]*)?)/gi) || [];
+                  m.forEach(function(u) {
+                    var cl = u.replace(/["']/g, '');
+                    var q = "360p SD";
+                    if (cl.includes('1080')) q = "1080p HD"; else if (cl.includes('720')) q = "720p HD"; else if (cl.includes('480')) q = "480p";
+                    if (!qs[q]) qs[q] = cl;
+                  });
+                  return qs;
+                }
+                document.addEventListener('contextmenu', function(e) {
+                  var a = e.target.closest('a');
+                  if (!a || !a.href) return;
+                  e.preventDefault();
+                  var t = a.innerText.trim() || 'Album';
+                  if (a.href.includes('watch') || a.href.includes('youtu.be')) {
+                    Bridge.postMessage(JSON.stringify({type: 'yt', url: a.href}));
+                    return;
+                  }
+                  fetch(a.href, {credentials: 'include'}).then(function(r){ return r.text(); }).then(function(h){
+                    var doc = new DOMParser().parseFromString(h, 'text/html');
+                    var songs = [], seen = {};
+                    doc.querySelectorAll('a[href], audio, source').forEach(function(el){
+                      var hr = el.getAttribute('href') || el.getAttribute('src');
+                      if (hr && hr.match(/\.(mp3|m4a|wav|aac)/i)) {
+                        try {
+                          var full = new URL(hr, a.href).href;
+                          var name = el.innerText.trim() || decodeURIComponent(full.split('/').pop().split('?')[0]);
+                          if (!seen[full]) { seen[full] = true; songs.push({name: name, url: full}); }
+                        } catch(x){}
+                      }
+                    });
+                    if (songs.length) {
+                      Bridge.postMessage(JSON.stringify({type: 'songs', name: t, url: a.href, list: songs}));
+                    } else {
+                      var v = scanVids();
+                      if (Object.keys(v).length) {
+                        Bridge.postMessage(JSON.stringify({type: 'vids', name: t, url: a.href, map: v}));
+                      }
+                    }
+                  }).catch(function(){});
+                }, true);
+              """);
             }
 
-            void _handleBridgeMessage(String jsonStr) {
+            void _onJs(String s) {
               try {
-                var data = jsonDecode(jsonStr);
-                String type = data['type'];
-
-                if (type == 'youtube') {
-                  _fetchYouTubeInfo(data['url']);
-                } 
-                else if (type == 'video_qualities') {
-                  Map<String, dynamic> rawQ = data['qualities'] ?? {};
-                  String thumb = data['thumb'] ?? '';
-                  Map<String, String> qMap = rawQ.map((k, v) => MapEntry(k.toString(), v.toString()));
-                  _showVideoQualityDialog(
-                    data['name'], 
-                    thumb, 
-                    qMap.isNotEmpty ? qMap : {'Original MP4': data['url']}, 
-                    data['url']
-                  );
-                } 
-                else if (type == 'folder_result') {
-                  String name = data['name'].toString().replaceAll(RegExp(r'[^\w\s\-]+'), '').trim();
-                  if (name.isEmpty) name = "Album";
-                  String pageUrl = data['url'];
-                  List<dynamic> songs = data['songs'] ?? [];
-
-                  if (songs.isNotEmpty) {
-                    _showFolderConfirmDialog(name, pageUrl, songs);
-                  }
-                }
+                var d = jsonDecode(s);
+                String t = d['type'];
+                if (t == 'yt') _yt(d['url']);
+                else if (t == 'vids') _showVids(d['name'], d['map'], d['url']);
+                else if (t == 'songs') _showSongs(d['name'], d['list'], d['url']);
               } catch (_) {}
             }
 
-            void _showVideoQualityDialog(String title, String thumb, Map<String, String> qualities, String referer) {
-              String selectedFormat = qualities.keys.first;
-
-              showModalBottomSheet(
-                context: context,
-                isScrollControlled: true,
-                shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
-                builder: (context) {
-                  return StatefulBuilder(
-                    builder: (context, setModalState) {
-                      return Container(
-                        padding: const EdgeInsets.all(16),
-                        height: MediaQuery.of(context).size.height * 0.65,
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                if (thumb.isNotEmpty)
-                                  ClipRRect(
-                                    borderRadius: BorderRadius.circular(8),
-                                    child: Image.network(thumb, width: 80, height: 60, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const Icon(Icons.video_library, size: 40)),
-                                  )
-                                else
-                                  const Icon(Icons.video_library, size: 50, color: Colors.red),
-                                const SizedBox(width: 12),
-                                Expanded(child: Text(title, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13))),
-                              ],
-                            ),
-                            const Divider(height: 20),
-                            const Text("🎬 Video Qualities", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.red)),
-                            const SizedBox(height: 8),
-                            Expanded(
-                              child: ListView(
-                                children: [
-                                  for (var q in qualities.keys)
-                                    RadioListTile(
-                                      title: Row(
-                                        children: [
-                                          Text(q),
-                                          const Spacer(),
-                                          if (_downloadedQualities[q] == true)
-                                            const Text("✓✓", style: TextStyle(color: Colors.blue, fontWeight: FontWeight.bold)),
-                                        ],
-                                      ),
-                                      value: q,
-                                      groupValue: selectedFormat,
-                                      onChanged: (val) {
-                                        setModalState(() {
-                                          selectedFormat = val.toString();
-                                        });
-                                      },
-                                    ),
-                                ],
-                              ),
-                            ),
-                            SizedBox(
-                              width: double.infinity,
-                              height: 48,
-                              child: ElevatedButton(
-                                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFFF2B42), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(25))),
-                                child: const Text("DOWNLOAD", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
-                                onPressed: () {
-                                  Navigator.pop(context);
-                                  String streamUrl = qualities[selectedFormat]!;
-                                  String cleanTitle = title.replaceAll(RegExp(r'[^\w\s]+'), '').trim();
-                                  if (cleanTitle.isEmpty) cleanTitle = "Video";
-                                  _startDirectDownload(streamUrl, "Videos", "$cleanTitle-$selectedFormat.mp4", referer);
-                                  setState(() {
-                                    _downloadedQualities[selectedFormat] = true;
-                                    _currentTab = 2;
-                                  });
-                                },
-                              ),
-                            ),
-                          ],
-                        ),
-                      );
-                    },
-                  );
-                },
-              );
-            }
-
-            void _showFolderConfirmDialog(String albumName, String pageUrl, List<dynamic> songs) {
+            void _showSongs(String name, List list, String page) {
               showDialog(
                 context: context,
                 builder: (ctx) => AlertDialog(
-                  title: Row(
-                    children: [
-                      const Icon(Icons.folder, color: Colors.amber, size: 28),
-                      const SizedBox(width: 8),
-                      Expanded(child: Text(albumName, style: const TextStyle(fontWeight: FontWeight.bold))),
-                    ],
-                  ),
-                  content: Text(
-                    "இந்த ஆல்பத்தில் ${songs.length} பாடல்கள் கண்டறியப்பட்டுள்ளன!\n\n"
-                    "அனைத்தையும் 'Download/$albumName/' ஃபோல்டரில் டவுன்லோட் செய்யவா?",
-                  ),
+                  title: Row(children: [const Icon(Icons.folder, color: Colors.amber), const SizedBox(width: 8), Expanded(child: Text(name))]),
+                  content: Text("இந்த ஆல்பத்தில் ${list.length} பாடல்கள் உள்ளன! அனைத்தையும் Download/$name/ ஃபோல்டரில் டவுன்லோட் செய்யவா?"),
                   actions: [
                     TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("Cancel")),
                     ElevatedButton(
                       style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
                       onPressed: () {
                         Navigator.pop(ctx);
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(content: Text("'$albumName' (${songs.length} பாடல்கள்) டவுன்லோட் தொடங்குகிறது...")),
-                        );
-                        for (var s in songs) {
-                          _startDirectDownload(s['url'], albumName, s['title'], pageUrl);
-                        }
+                        for (var x in list) _download(x['url'], name, x['name'], page);
                         setState(() => _currentTab = 2);
                       },
-                      child: Text("Download All (${songs.length})", style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                      child: Text("Download All (${list.length})", style: const TextStyle(color: Colors.white)),
                     )
                   ],
                 ),
               );
             }
 
-            Future<void> _startDirectDownload(String fileUrl, String subfolder, String fileName, String sourcePage) async {
-              String taskId = DateTime.now().millisecondsSinceEpoch.toString() + fileUrl.hashCode.toString();
-              String name = fileName.replaceAll(RegExp(r'[^\w\s\.\-]+'), '').trim();
-              if (!name.toLowerCase().endsWith('.mp3') && !name.toLowerCase().endsWith('.mp4')) {
-                name = "$name.mp4";
-              }
-
-              CancelToken cancelToken = CancelToken();
-              var task = DownloadTask(
-                id: taskId,
-                name: name,
-                subfolder: subfolder,
-                fileUrl: fileUrl,
-                sourcePage: sourcePage.isNotEmpty ? sourcePage : fileUrl,
-                cancelToken: cancelToken,
-              );
-
-              setState(() {
-                _tasksMap[taskId] = task;
-              });
-
-              try {
-                Directory baseDir = Directory('/storage/emulated/0/Download');
-                try {
-                  if (!await baseDir.exists()) baseDir = (await getExternalStorageDirectory())!;
-                } catch (_) {
-                  baseDir = (await getExternalStorageDirectory())!;
-                }
-
-                Directory targetDir = Directory('${baseDir.path}/$subfolder');
-                if (!await targetDir.exists()) await targetDir.create(recursive: true);
-
-                String savePath = "${targetDir.path}/$name";
-                var dio = _getSafeDio(sourcePage);
-
-                await dio.download(
-                  fileUrl,
-                  savePath,
-                  cancelToken: cancelToken,
-                  onReceiveProgress: (rec, total) {
-                    if (total > 0 && mounted) {
-                      setState(() {
-                        task.progress = rec / total;
-                        task.status = 'downloading';
-                      });
-                    }
-                  },
-                );
-
-                if (mounted) {
-                  setState(() {
-                    task.status = 'completed';
-                    _tasksMap.remove(taskId);
-                  });
-                  _loadDownloadedFiles();
-                }
-              } catch (e) {
-                if (mounted) {
-                  setState(() {
-                    task.status = 'failed';
-                  });
-                }
-              }
-            }
-
-            void _fetchYouTubeInfo(String url) async {
-              if (_isBottomSheetOpen || _isLoading) return;
-              _isBottomSheetOpen = true;
-              if (mounted) setState(() => _isLoading = true);
-
-              var yt = YoutubeExplode();
-              try {
-                var video = await yt.videos.get(url);
-                var manifest = await yt.videos.streamsClient.getManifest(video.id);
-                if (mounted) setState(() => _isLoading = false);
-                await _showYouTubeQualityDialog(video, manifest);
-              } catch (_) {
-                if (mounted) setState(() => _isLoading = false);
-              } finally {
-                yt.close();
-                _isBottomSheetOpen = false;
-              }
-            }
-
-            Future<void> _showYouTubeQualityDialog(Video video, StreamManifest manifest) async {
-              String selectedFormat = '720p';
-              dynamic selectedStream;
-              var muxedStreams = manifest.muxed;
-              var audioStreams = manifest.audioOnly;
-
-              await showModalBottomSheet(
+            void _showVids(String title, Map map, String page) {
+              String sel = map.keys.first;
+              showModalBottomSheet(
                 context: context,
-                isScrollControlled: true,
-                shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
-                builder: (context) {
-                  return StatefulBuilder(
-                    builder: (context, setModalState) {
-                      return Container(
-                        padding: const EdgeInsets.all(16),
-                        height: MediaQuery.of(context).size.height * 0.75,
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                ClipRRect(
-                                  borderRadius: BorderRadius.circular(8),
-                                  child: Image.network(video.thumbnails.mediumResUrl, width: 80, height: 60, fit: BoxFit.cover),
-                                ),
-                                const SizedBox(width: 12),
-                                Expanded(child: Text(video.title, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13))),
-                              ],
-                            ),
-                            const Divider(height: 20),
-                            const Text("🎵 Audio", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.red)),
-                            RadioListTile(
-                              title: Row(
-                                children: [
-                                  const Text("MP3 Audio"),
-                                  const Spacer(),
-                                  if (_downloadedQualities['audio'] == true)
-                                    const Text("✓✓", style: TextStyle(color: Colors.blue, fontWeight: FontWeight.bold)),
-                                ],
-                              ),
-                              value: 'audio',
-                              groupValue: selectedFormat,
-                              onChanged: (val) {
-                                setModalState(() {
-                                  selectedFormat = val.toString();
-                                  selectedStream = audioStreams.withHighestBitrate();
-                                });
-                              },
-                            ),
-                            const Text("🎬 Video Qualities", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.red)),
-                            Expanded(
-                              child: ListView(
-                                children: [
-                                  for (var q in ['1080p', '720p', '480p', '360p', '240p'])
-                                    RadioListTile(
-                                      title: Row(
-                                        children: [
-                                          Text("$q HD"),
-                                          const Spacer(),
-                                          if (_downloadedQualities[q] == true)
-                                            const Text("✓✓", style: TextStyle(color: Colors.blue, fontWeight: FontWeight.bold)),
-                                        ],
-                                      ),
-                                      value: q,
-                                      groupValue: selectedFormat,
-                                      onChanged: (val) {
-                                        setModalState(() {
-                                          selectedFormat = val.toString();
-                                          selectedStream = muxedStreams.firstWhere((s) => s.qualityLabel.contains(q), orElse: () => muxedStreams.first);
-                                        });
-                                      },
-                                    ),
-                                ],
-                              ),
-                            ),
-                            SizedBox(
-                              width: double.infinity,
-                              height: 48,
-                              child: ElevatedButton(
-                                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFFF2B42), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(25))),
-                                child: const Text("DOWNLOAD", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
-                                onPressed: () {
-                                  Navigator.pop(context);
-                                  _downloadYouTubeStream(video, selectedStream ?? muxedStreams.first, selectedFormat);
-                                },
-                              ),
-                            ),
-                          ],
+                builder: (ctx) => StatefulBuilder(
+                  builder: (ctx, setS) => Container(
+                    padding: const EdgeInsets.all(16),
+                    height: 350,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(title, maxLines: 2, style: const TextStyle(fontWeight: FontWeight.bold)),
+                        const Divider(),
+                        Expanded(
+                          child: ListView(
+                            children: [
+                              for (var k in map.keys)
+                                RadioListTile(title: Text(k), value: k, groupValue: sel, onChanged: (v) => setS(() => sel = v.toString())),
+                            ],
+                          ),
                         ),
-                      );
-                    },
-                  );
-                },
+                        SizedBox(
+                          width: double.infinity,
+                          child: ElevatedButton(
+                            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                            onPressed: () {
+                              Navigator.pop(ctx);
+                              _download(map[sel], "Videos", "$title-$sel.mp4", page);
+                              setState(() => _currentTab = 2);
+                            },
+                            child: const Text("DOWNLOAD", style: TextStyle(color: Colors.white)),
+                          ),
+                        )
+                      ],
+                    ),
+                  ),
+                ),
               );
             }
 
-            Future<void> _downloadYouTubeStream(Video video, dynamic streamInfo, String quality) async {
-              String cleanTitle = video.title.replaceAll(RegExp(r'[^\w\s]+'), '');
-              String fileName = "$cleanTitle-$quality.mp4";
-              String taskId = DateTime.now().millisecondsSinceEpoch.toString();
+            Future<void> _download(String url, String folder, String name, String page) async {
+              String tid = DateTime.now().millisecondsSinceEpoch.toString() + url.hashCode.toString();
+              String fn = name.replaceAll(RegExp(r'[^\w\s\.\-]+'), '').trim();
+              if (!fn.toLowerCase().endsWith('.mp3') && !fn.toLowerCase().endsWith('.mp4')) fn = "$fn.mp3";
 
-              Directory baseDir = Directory('/storage/emulated/0/Download');
-              if (!await baseDir.exists()) baseDir = (await getExternalStorageDirectory())!;
-              var file = File('${baseDir.path}/$fileName');
-              var fileStream = file.openWrite();
+              CancelToken ct = CancelToken();
+              var task = DownloadTask(id: tid, name: fn, subfolder: folder, fileUrl: url, sourcePage: page, cancelToken: ct);
+              setState(() => _tasks[tid] = task);
 
-              var task = DownloadTask(
-                id: taskId,
-                name: fileName,
-                subfolder: "YouTube",
-                fileUrl: video.url,
-                sourcePage: video.url,
-              );
-
-              setState(() {
-                _tasksMap[taskId] = task;
-                _currentTab = 2;
-              });
-
-              var yt = YoutubeExplode();
-              var stream = yt.videos.streamsClient.get(streamInfo);
-
-              await stream.pipe(fileStream);
-              await fileStream.flush();
-              await fileStream.close();
-              yt.close();
-
-              setState(() {
-                _downloadedQualities[quality] = true;
-                _tasksMap.remove(taskId);
-              });
-              _loadDownloadedFiles();
-              ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("✅ Saved $quality (✓✓)!")));
-            }
-
-            Future<void> _loadBookmarks() async {
-              final prefs = await SharedPreferences.getInstance();
-              final String? data = prefs.getString('saved_bookmarks');
-              if (data != null) {
-                setState(() {
-                  _bookmarks = List<Map<String, String>>.from((jsonDecode(data) as List).map((i) => Map<String, String>.from(i)));
-                });
-              }
-            }
-
-            Future<void> _toggleBookmark() async {
-              String? currentUrl = await _webController.currentUrl();
-              String? title = await _webController.getTitle();
-              if (currentUrl == null) return;
-
-              final prefs = await SharedPreferences.getInstance();
-              bool exists = _bookmarks.any((b) => b['url'] == currentUrl);
-
-              setState(() {
-                if (exists) {
-                  _bookmarks.removeWhere((b) => b['url'] == currentUrl);
-                  _isCurrentUrlBookmarked = false;
-                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Bookmark நீக்கப்பட்டது! ❌")));
-                } else {
-                  _bookmarks.add({'title': title ?? 'Page', 'url': currentUrl});
-                  _isCurrentUrlBookmarked = true;
-                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Bookmark சேமிக்கப்பட்டது! ⭐")));
-                }
-              });
-              await prefs.setString('saved_bookmarks', jsonEncode(_bookmarks));
-            }
-
-            Future<void> _loadDownloadedFiles() async {
               try {
                 Directory dir = Directory('/storage/emulated/0/Download');
                 if (!await dir.exists()) dir = (await getExternalStorageDirectory())!;
-                if (await dir.exists()) {
-                  setState(() {
-                    _downloadedFiles = dir.listSync(recursive: true).where((f) {
-                      String ext = f.path.split('.').last.toLowerCase();
-                      return ['mp4', 'mp3', 'm4a', 'wav', 'aac'].contains(ext);
-                    }).toList();
-                  });
+                Directory tDir = Directory('${dir.path}/$folder');
+                if (!await tDir.exists()) await tDir.create(recursive: true);
+
+                await _dio(page).download(url, "${tDir.path}/$fn", cancelToken: ct, onReceiveProgress: (r, t) {
+                  if (t > 0 && mounted) setState(() => task.progress = r / t);
+                });
+
+                if (mounted) { setState(() => _tasks.remove(tid)); _loadSaved(); }
+              } catch (_) {
+                if (mounted) setState(() => task.status = 'failed');
+              }
+            }
+
+            void _yt(String u) async {
+              var yt = YoutubeExplode();
+              try {
+                var v = await yt.videos.get(u);
+                var m = await yt.videos.streamsClient.getManifest(v.id);
+                Map qs = {};
+                for (var s in m.muxed) qs[s.qualityLabel] = s.url.toString();
+                if (m.audioOnly.isNotEmpty) qs['MP3 Audio'] = m.audioOnly.withHighestBitrate().url.toString();
+                _showVids(v.title, qs, u);
+              } catch (_) {} finally { yt.close(); }
+            }
+
+            void _loadSaved() async {
+              try {
+                Directory d = Directory('/storage/emulated/0/Download');
+                if (!await d.exists()) d = (await getExternalStorageDirectory())!;
+                if (await d.exists()) {
+                  setState(() => _files = d.listSync(recursive: true).where((f) {
+                    var e = f.path.split('.').last.toLowerCase();
+                    return ['mp4', 'mp3', 'm4a'].contains(e);
+                  }).toList());
                 }
               } catch (_) {}
             }
 
-            void _handleGoOrReload() {
-              if (_searchFocusNode.hasFocus) {
-                _searchFocusNode.unfocus();
-                String target = _searchController.text.trim();
-                if (!target.startsWith('http')) target = 'https://m.youtube.com/results?search_query=${Uri.encodeComponent(target)}';
-                _webController.loadRequest(Uri.parse(target));
-              } else if (_isLoading) {
-                _webController.runJavaScript('window.stop();');
-                setState(() => _isLoading = false);
-              } else {
-                _webController.reload();
-              }
+            void _checkBm(String u) async {
+              final p = await SharedPreferences.getInstance();
+              var raw = p.getString('bm');
+              if (raw != null) _bookmarks = List<Map<String, String>>.from((jsonDecode(raw) as List).map((i) => Map<String, String>.from(i)));
+              if (mounted) setState(() => _isBookmarked = _bookmarks.any((b) => b['url'] == u));
             }
 
-            Future<bool> _handleWillPop() async {
-              if (_currentTab != 0) {
-                setState(() => _currentTab = 0);
-                return false;
-              }
-              if (await _webController.canGoBack()) {
-                await _webController.goBack();
-                return false;
-              }
+            void _toggleBm() async {
+              String? u = await _web.currentUrl(), t = await _web.getTitle();
+              if (u == null) return;
+              final p = await SharedPreferences.getInstance();
+              if (_isBookmarked) { _bookmarks.removeWhere((b) => b['url'] == u); }
+              else { _bookmarks.add({'title': t ?? 'Page', 'url': u}); }
+              await p.setString('bm', jsonEncode(_bookmarks));
+              setState(() => _isBookmarked = !_isBookmarked);
+            }
 
-              DateTime now = DateTime.now();
-              if (_lastBackPressTime == null || now.difference(_lastBackPressTime!) > const Duration(seconds: 2)) {
-                _lastBackPressTime = now;
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text("வெளியேற மீண்டும் Back பட்டனை அழுத்தவும்"),
-                    duration: Duration(seconds: 2),
-                  ),
-                );
+            Future<bool> _back() async {
+              if (_currentTab != 0) { setState(() => _currentTab = 0); return false; }
+              if (await _web.canGoBack()) { await _web.goBack(); return false; }
+              var now = DateTime.now();
+              if (_lastBack == null || now.difference(_lastBack!) > const Duration(seconds: 2)) {
+                _lastBack = now;
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("வெளியேற மீண்டும் Back அழுத்தவும்"), duration: Duration(seconds: 2)));
                 return false;
               }
               return true;
@@ -752,10 +314,9 @@ jobs:
 
             @override
             Widget build(BuildContext context) {
-              var tasksList = _tasksMap.values.toList();
-
+              var tasks = _tasks.values.toList();
               return WillPopScope(
-                onWillPop: _handleWillPop,
+                onWillPop: _back,
                 child: Scaffold(
                   appBar: AppBar(
                     backgroundColor: Colors.white,
@@ -764,27 +325,94 @@ jobs:
                       height: 38,
                       decoration: BoxDecoration(color: Colors.grey[200], borderRadius: BorderRadius.circular(20)),
                       child: TextField(
-                        controller: _searchController,
-                        focusNode: _searchFocusNode,
-                        style: const TextStyle(fontSize: 14),
+                        controller: _urlCtrl,
+                        focusNode: _focus,
                         decoration: InputDecoration(
                           hintText: "Search or enter URL...",
                           prefixIcon: const Icon(Icons.search, size: 18, color: Colors.grey),
                           suffixIcon: IconButton(
-                            icon: Icon(
-                              _searchFocusNode.hasFocus
-                                  ? Icons.arrow_forward
-                                  : (_isLoading ? Icons.close : Icons.refresh),
-                              size: 18,
-                              color: _searchFocusNode.hasFocus ? Colors.red : Colors.grey[700],
-                            ),
-                            onPressed: _handleGoOrReload,
+                            icon: Icon(_focus.hasFocus ? Icons.arrow_forward : (_isLoading ? Icons.close : Icons.refresh), size: 18),
+                            onPressed: () {
+                              if (_focus.hasFocus) { _focus.unfocus(); var u = _urlCtrl.text.trim(); _web.loadRequest(Uri.parse(u.startsWith('http') ? u : 'https://m.youtube.com/results?search_query=${Uri.encodeComponent(u)}')); }
+                              else if (_isLoading) { _web.runJavaScript('window.stop();'); setState(() => _isLoading = false); }
+                              else { _web.reload(); }
+                            },
                           ),
                           border: InputBorder.none,
                           contentPadding: const EdgeInsets.only(top: 8),
                         ),
-                        onSubmitted: (url) {
-                          _searchFocusNode.unfocus();
-                          String target = url.trim();
-                          if (!target.startsWith('http')) target = 'https://m.youtube.com/results?search_query=${Uri.encodeComponent(target)}';
-                          _webControl
+                      ),
+                    ),
+                    actions: [
+                      IconButton(icon: Icon(Icons.desktop_windows, size: 21, color: _desktop ? Colors.blue : Colors.black87), onPressed: () { setState(() => _desktop = !_desktop); _web.setUserAgent(_desktop ? dUA : mUA); _web.reload(); }),
+                      IconButton(icon: const Icon(Icons.add_box_outlined, size: 21, color: Colors.black87), onPressed: () { _urlCtrl.clear(); _web.loadRequest(Uri.parse('https://www.google.com')); setState(() => _currentTab = 0); }),
+                      IconButton(icon: Icon(_isBookmarked ? Icons.star : Icons.star_border, size: 22, color: _isBookmarked ? Colors.amber : Colors.grey), onPressed: _toggleBm),
+                    ],
+                  ),
+                  body: IndexedStack(
+                    index: _currentTab,
+                    children: [
+                      Stack(children: [WebViewWidget(controller: _web), if (_isLoading) const Center(child: CircularProgressIndicator(color: Colors.red))]),
+                      ListView.builder(itemCount: _bookmarks.length, itemBuilder: (c, i) => ListTile(title: Text(_bookmarks[i]['title'] ?? ''), subtitle: Text(_bookmarks[i]['url'] ?? ''), onTap: () { _web.loadRequest(Uri.parse(_bookmarks[i]['url']!)); setState(() => _currentTab = 0); })),
+                      Column(
+                        children: [
+                          TabBar(controller: _tabController, labelColor: Colors.red, unselectedLabelColor: Colors.grey, tabs: [Tab(text: "Downloading (${tasks.length})"), Tab(text: "Downloaded (${_files.length})")]),
+                          Expanded(
+                            child: TabBarView(
+                              controller: _tabController,
+                              children: [
+                                ListView.builder(itemCount: tasks.length, itemBuilder: (c, i) {
+                                  var t = tasks[i];
+                                  return Card(margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 6), child: ListTile(
+                                    title: Text(t.name, maxLines: 1),
+                                    subtitle: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text("Folder: ${t.subfolder}"), LinearProgressIndicator(value: t.progress > 0 ? t.progress : null, color: Colors.red)]),
+                                    trailing: IconButton(icon: const Icon(Icons.close), onPressed: () { t.cancelToken?.cancel(); setState(() => _tasks.remove(t.id)); }),
+                                  ));
+                                }),
+                                ListView.builder(itemCount: _files.length, itemBuilder: (c, i) => ListTile(leading: const Icon(Icons.music_video, color: Colors.red), title: Text(_files[i].path.split('/').last), subtitle: Text(_files[i].path))),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                      const Center(child: Text("VidMate Pro Edition")),
+                    ],
+                  ),
+                  floatingActionButton: _currentTab == 0 ? FloatingActionButton(backgroundColor: Colors.red, child: const Icon(Icons.download, color: Colors.white), onPressed: () async {
+                    var u = await _web.currentUrl();
+                    if (u != null) {
+                      if (u.contains('watch') || u.contains('youtu.be')) _yt(u);
+                      else _web.runJavaScript("var s = scan(); if (s.length) Bridge.postMessage(JSON.stringify({type: 'songs', name: 'Downloads', url: location.href, list: s})); else { var v = scanVids(); if (Object.keys(v).length) Bridge.postMessage(JSON.stringify({type: 'vids', name: document.title, url: location.href, map: v})); }");
+                    }
+                  }) : null,
+                  bottomNavigationBar: BottomNavigationBar(
+                    currentIndex: _currentTab,
+                    selectedItemColor: Colors.red,
+                    unselectedItemColor: Colors.grey,
+                    type: BottomNavigationBarType.fixed,
+                    onTap: (i) { if (i == 2) _loadSaved(); setState(() => _currentTab = i); },
+                    items: const [BottomNavigationBarItem(icon: Icon(Icons.home), label: "Home"), BottomNavigationBarItem(icon: Icon(Icons.bookmark), label: "Bookmarks"), BottomNavigationBarItem(icon: Icon(Icons.download), label: "Downloads"), BottomNavigationBarItem(icon: Icon(Icons.settings), label: "Settings")],
+                  ),
+                ),
+              );
+            }
+          }
+          EOF
+
+      - name: 7. Configure Android & Cleartext
+        run: |
+          sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>' my_downloader/android/app/src/main/AndroidManifest.xml
+          sed -i 's/<application/<application android:usesCleartextTraffic="true" android:requestLegacyExternalStorage="true"/' my_downloader/android/app/src/main/AndroidManifest.xml
+          sed -i 's/signingConfig = signingConfigs.release/signingConfig = signingConfigs.debug/g' my_downloader/android/app/build.gradle* 2>/dev/null || true
+
+      - name: 8. Build Release APK
+        run: |
+          cd my_downloader
+          flutter build apk --release --build-number=${{ github.run_number }} --build-name=1.0.${{ github.run_number }}
+
+      - name: 9. Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VidMate-Final-APK
+          path: my_downloader/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
